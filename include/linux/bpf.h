@@ -2123,6 +2123,8 @@ void bpf_prog_disassoc_struct_ops(struct bpf_prog *prog);
 void *bpf_prog_get_assoc_struct_ops(const struct bpf_prog_aux *aux);
 u32 bpf_struct_ops_id(const void *kdata);
 
+int bpf_fault_ops_link_create(union bpf_attr *attr);
+
 #ifdef CONFIG_NET
 /* Define it here to avoid the use of forward declaration */
 struct bpf_dummy_ops_state {
@@ -2179,6 +2181,12 @@ static inline void *bpf_prog_get_assoc_struct_ops(const struct bpf_prog_aux *aux
 {
 	return NULL;
 }
+
+static inline int bpf_fault_ops_link_create(union bpf_attr *attr)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline void bpf_map_struct_ops_info_fill(struct bpf_map_info *info, struct bpf_map *map)
 {
 }
