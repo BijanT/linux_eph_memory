@@ -354,6 +354,7 @@ enum {
 	DECLARE_VMA_BIT(UFFD_MINOR, 41),
 	DECLARE_VMA_BIT(SEALED, 42),
 	DECLARE_VMA_BIT(BPF_FAULT, 43),
+	DECLARE_VMA_BIT(BPF_FAULT_WP, 44),
 	/* Flags that reuse flags above. */
 	DECLARE_VMA_BIT_ALIAS(PKEY_BIT0, HIGH_ARCH_0),
 	DECLARE_VMA_BIT_ALIAS(PKEY_BIT1, HIGH_ARCH_1),
@@ -514,8 +515,10 @@ enum {
 
 #ifdef CONFIG_BPF_FAULT
 #define VM_BPF_FAULT          INIT_VM_FLAG(BPF_FAULT)
+#define VM_BPF_FAULT_WP       INIT_VM_FLAG(BPF_FAULT_WP)
 #else /* !CONFIG_BPF_FAULT */
 #define VM_BPF_FAULT          VM_NONE
+#define VM_BPF_FAULT_WP       VM_NONE
 #endif /* CONFIG_BPF_FAULT */
 
 /* Bits set in the VMA until the stack is in its final location */

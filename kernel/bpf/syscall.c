@@ -6235,6 +6235,16 @@ put_prog:
 	return ret;
 }
 
+#define BPF_LINK_WRITEPROTECT_LAST_FIELD link_writeprotect.len
+
+static int link_writeprotect(union bpf_attr *attr)
+{
+	if (CHECK_ATTR(BPF_LINK_WRITEPROTECT))
+		return -EINVAL;
+
+	return bpf_fault_ops_link_writeprotect(attr);
+}
+
 static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 {
 	union bpf_attr attr;
@@ -6376,6 +6386,9 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 		break;
 	case BPF_PROG_ASSOC_STRUCT_OPS:
 		err = prog_assoc_struct_ops(&attr);
+		break;
+	case BPF_LINK_WRITEPROTECT:
+		err = link_writeprotect(&attr);
 		break;
 	default:
 		err = -EINVAL;
