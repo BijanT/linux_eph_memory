@@ -463,4 +463,5 @@ LIBBPF_1.8.0 {
 		bpf_link__fault_register;
 		bpf_link__fault_unregister;
 		btf__new_empty_opts;
+		bpf_link__fault_claim;
 } LIBBPF_1.7.0;

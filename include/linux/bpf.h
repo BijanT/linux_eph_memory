@@ -2128,6 +2128,7 @@ int bpf_fault_ops_link_create(union bpf_attr *attr);
 int bpf_fault_ops_link_writeprotect(union bpf_attr *attr);
 int bpf_fault_ops_link_add_region(union bpf_attr *attr);
 int bpf_fault_ops_link_remove_region(union bpf_attr *attr);
+int bpf_fault_ops_link_claim(union bpf_attr *attr);
 
 #ifdef CONFIG_NET
 /* Define it here to avoid the use of forward declaration */
@@ -2202,6 +2203,11 @@ static inline int bpf_fault_ops_link_add_region(union bpf_attr *attr)
 }
 
 static inline int bpf_fault_ops_link_remove_region(union bpf_attr *attr)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int bpf_fault_ops_link_claim(union bpf_attr *attr)
 {
 	return -EOPNOTSUPP;
 }
