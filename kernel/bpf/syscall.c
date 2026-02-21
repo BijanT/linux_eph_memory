@@ -6235,13 +6235,27 @@ put_prog:
 	return ret;
 }
 
-#define BPF_LINK_WRITEPROTECT_LAST_FIELD link_writeprotect.len
+#define BPF_LINK_FAULT_OPS_CMD_LAST_FIELD link_fault_cmd.len
 
-static int link_writeprotect(union bpf_attr *attr)
+static int link_fault_ops_cmd(union bpf_attr *attr)
 {
-	if (CHECK_ATTR(BPF_LINK_WRITEPROTECT))
+	__u32 flags;
+
+	if (CHECK_ATTR(BPF_LINK_FAULT_OPS_CMD))
 		return -EINVAL;
 
+	flags = attr->link_fault_cmd.flags;
+
+	/* Only one flag may be set at a time */
+	if (hweight32(flags) > 1)
+		return -EINVAL;
+
+	if (flags & BPF_FAULT_REGISTER)
+		return bpf_fault_ops_link_add_region(attr);
+	if (flags & BPF_FAULT_UNREGISTER)
+		return bpf_fault_ops_link_remove_region(attr);
+
+	/* BPF_FAULT_WP_ENABLE or 0 (resolve) → writeprotect path */
 	return bpf_fault_ops_link_writeprotect(attr);
 }
 
@@ -6387,8 +6401,8 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 	case BPF_PROG_ASSOC_STRUCT_OPS:
 		err = prog_assoc_struct_ops(&attr);
 		break;
-	case BPF_LINK_WRITEPROTECT:
-		err = link_writeprotect(&attr);
+	case BPF_LINK_FAULT_OPS_CMD:
+		err = link_fault_ops_cmd(&attr);
 		break;
 	default:
 		err = -EINVAL;
