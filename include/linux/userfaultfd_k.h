@@ -71,7 +71,7 @@ static inline bool bpf_fault_pte_wp(struct vm_area_struct *vma, pte_t pte)
 	return bpf_fault_wp(vma) && pte_uffd_wp(pte);
 }
 
-vm_fault_t handle_bpf_fault(struct vm_fault *vmf);
+vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete);
 vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf);
 
 struct fault_ops *bpf_fault_ops_map(struct bpf_fault_ops_link *link);
@@ -317,7 +317,12 @@ bool vma_can_userfault(struct vm_area_struct *vma, vm_flags_t vm_flags,
 
 static inline bool vma_can_bpf_fault(struct vm_area_struct *vma)
 {
-	return vma_is_anonymous(vma) || is_vm_hugetlb_page(vma) || vma_is_shmem(vma);
+	if (vma_is_anonymous(vma) || is_vm_hugetlb_page(vma) ||
+	    vma_is_shmem(vma))
+		return true;
+
+	/* File-backed VMAs with a fault handler (ext4, xfs, etc.) */
+	return vma->vm_ops && vma->vm_ops->fault;
 }
 
 static inline bool vma_has_uffd_without_event_remap(struct vm_area_struct *vma)
@@ -416,7 +421,8 @@ static inline bool pte_swp_uffd_wp_any(pte_t pte)
 }
 #else /* CONFIG_USERFAULTFD */
 
-static inline vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
+static inline vm_fault_t handle_bpf_fault(struct vm_fault *vmf,
+					  bool can_complete)
 {
 	return VM_FAULT_SIGBUS;
 }
