@@ -13,6 +13,7 @@
 #include <linux/namei.h>
 #include <linux/pagemap.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
 #include <linux/spinlock.h>
 #include <linux/statfs.h>
@@ -25,6 +26,7 @@
 
 static const struct super_operations ephmfs_ops;
 static const struct inode_operations ephmfs_dir_inode_ops;
+static struct vm_operations_struct ephmfs_vm_ops;
 static struct kobj_attribute ephmfs_devs_attr;
 
 static struct ephmfs_sb_info *EMFS_SB(struct super_block *sb)
@@ -296,7 +298,59 @@ static int ephmfs_unmap_pages(struct inode *inode)
 
 static void ephmfs_remap_pages(struct inode *inode)
 {
-	/* Leave empty for now. Page table will repopulate via page faults. */
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+	struct ephmfs_sb_info *sbi = EMFS_SB(inode->i_sb);
+	u64 page_shift = ilog2(sbi->page_size);
+	struct mm_struct *mm = current->mm;
+	struct ephmfs_page *page;
+	struct vm_area_struct *vma;
+	unsigned long index = 0;
+	unsigned int fault_flags;
+	unsigned long addr;
+	bool unlocked;
+
+	if (!mm)
+		return;
+
+	mmap_read_lock(mm);
+	/*
+	 * Go through every page that has been mapped in info->mt and trigger
+	 * a fault for each one to map them again.
+	 */
+	while (true) {
+		fault_flags = 0;
+		unlocked = false;
+
+		cond_resched();
+
+		/* Find the next page in the maple tree */
+		spin_lock(&info->lock);
+		page = mt_find(&info->mt, &index, ULONG_MAX);
+		if (!page) {
+			spin_unlock(&info->lock);
+			break;
+		}
+		addr = info->base_addr + (page->page_offset << page_shift);
+		spin_unlock(&info->lock);
+
+		/* Don't refault in revoked pages */
+		if (READ_ONCE(page->revoked))
+			continue;
+
+		/* fixup_user_fault() may drop mmap_lock, so re-lookup each time */
+		vma = vma_lookup(mm, addr);
+		if (!vma || vma->vm_ops != &ephmfs_vm_ops ||
+			file_inode(vma->vm_file) != inode) {
+			/* The page is no longer mapped, so we can't remap it */
+			continue;
+		}
+		if (vma->vm_flags & VM_WRITE)
+			fault_flags |= FAULT_FLAG_WRITE;
+
+		if (fixup_user_fault(mm, addr, fault_flags, &unlocked) == -EINTR)
+			break;
+	}
+	mmap_read_unlock(mm);
 }
 
 static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
@@ -314,11 +368,14 @@ static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 
 	iomap->flags = 0;
 	iomap->offset = offset;
-	iomap->length = length;
+	iomap->length = min_t(u64, length, sbi->page_size);
 
 	page = ephmfs_alloc_and_insert_page(sbi, inode_info, page_offset, &new_page);
 	if (IS_ERR(page))
 		return PTR_ERR(page);
+	/* If a page has been revoked, there's little sense in mapping it again */
+	if (READ_ONCE(page->revoked))
+		return -EIO;
 
 	if (new_page)
 		iomap->flags |= IOMAP_F_NEW;
@@ -405,14 +462,31 @@ static struct vm_operations_struct ephmfs_vm_ops = {
 	.pfn_mkwrite = ephmfs_fault,
 };
 
-static long ephmfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static long ephmfs_attempt_on(struct inode *inode)
 {
-	struct inode *inode = file_inode(file);
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+	bool remap;
+
+	spin_lock(&info->lock);
+	if (!info->owner || !same_thread_group(info->owner, current)) {
+		spin_unlock(&info->lock);
+		return -EPERM;
+	}
+	remap = info->attempt_count == 0;
+	info->attempt_count++;
+	spin_unlock(&info->lock);
+
+	/* Can't hold info->lock here because the fault path will take it */
+	if (remap)
+		ephmfs_remap_pages(inode);
+
+	return 0;
+}
+
+static long ephmfs_attempt_off(struct inode *inode)
+{
 	struct ephmfs_inode_info *info = EMFS_INODE(inode);
 	long ret = 0;
-
-	if (cmd != EPHMFS_IOCTL_ATTEMPT_ON && cmd != EPHMFS_IOCTL_ATTEMPT_OFF)
-		return -ENOTTY;
 
 	filemap_invalidate_lock(inode->i_mapping);
 	spin_lock(&info->lock);
@@ -422,44 +496,44 @@ static long ephmfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		goto out_unlock;
 	}
 
-	switch (cmd) {
-	case EPHMFS_IOCTL_ATTEMPT_ON:
-		if (info->attempt_count == 0) {
-			/*
-			 * Don't need to release inode_info.lock since
-			 * ephmfs_remap_pages() is currently a no-op.
-			 */
-			ephmfs_remap_pages(inode);
-		}
-		info->attempt_count++;
-		break;
-	case EPHMFS_IOCTL_ATTEMPT_OFF:
-		if (info->attempt_count == 0) {
-			ret = -EINVAL;
+	if (info->attempt_count == 0) {
+		ret = -EINVAL;
+		goto out_unlock;
+	} else if (info->attempt_count == 1) {
+		spin_unlock(&info->lock);
+		ret = ephmfs_unmap_pages(inode);
+		spin_lock(&info->lock);
+		if (ret)
 			goto out_unlock;
-		} else if (info->attempt_count == 1) {
-			spin_unlock(&info->lock);
-			ret = ephmfs_unmap_pages(inode);
-			spin_lock(&info->lock);
-			if (ret)
-				goto out_unlock;
-			/*
-			 * Check if we raced with ephmfs_close() while we let
-			 * go of inode_info->lock and it zeroed the attempt
-			 * count.
-			 * No need to return error in this case.
-			 */
-			if (info->attempt_count == 0)
-				goto out_unlock;
-		}
-		info->attempt_count--;
-		break;
+		/*
+		 * Check if we raced with ephmfs_close() while we let
+		 * go of inode_info->lock and it zeroed the attempt
+		 * count.
+		 * No need to return error in this case.
+		 */
+		if (info->attempt_count == 0)
+			goto out_unlock;
 	}
+	info->attempt_count--;
 
 out_unlock:
 	spin_unlock(&info->lock);
 	filemap_invalidate_unlock(inode->i_mapping);
 	return ret;
+}
+
+static long ephmfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct inode *inode = file_inode(file);
+
+	switch (cmd) {
+	case EPHMFS_IOCTL_ATTEMPT_ON:
+		return ephmfs_attempt_on(inode);
+	case EPHMFS_IOCTL_ATTEMPT_OFF:
+		return ephmfs_attempt_off(inode);
+	default:
+		return -ENOTTY;
+	}
 }
 
 static int ephmfs_mmap(struct file *file, struct vm_area_struct *vma)
