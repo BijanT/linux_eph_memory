@@ -910,6 +910,7 @@ static int ephmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi = kzalloc(sizeof(struct ephmfs_sb_info), GFP_KERNEL);
 	if (!sbi)
 		return -ENOMEM;
+	sb->s_fs_info = sbi;
 
 	sbi->page_size = PAGE_SIZE;
 	/*
@@ -925,15 +926,14 @@ static int ephmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	err = kobject_add(&sbi->sysfs_kobj, fs_kobj, "ephmfs");
 	if (err) {
 		pr_err("EphMFS: Failed to add sysfs kobject\n");
-		goto err_out;
+		return err; /* ephmfs_kill_sb cleans up */
 	}
 	err = sysfs_create_file(&sbi->sysfs_kobj, &ephmfs_devs_attr.attr);
 	if (err) {
 		pr_err("EphMFS: Failed to create sysfs devs attribute\n");
-		goto kobj_put;
+		return err; /* ephmfs_kill_sb cleans up */
 	}
 
-	sb->s_fs_info = sbi;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_magic = 0xE1E2E3E4;
 	sb->s_op = &ephmfs_ops;
@@ -946,16 +946,10 @@ static int ephmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (!sb->s_root) {
 		pr_err("EphMFS: Failed to add make root inode\n");
 		err = -ENOMEM;
-		goto kobj_put;
+		return err; /* ephmfs_kill_sb cleans up */
 	}
 
 	return 0;
-kobj_put:
-	kobject_put(&sbi->sysfs_kobj);
-err_out:
-	kfree(sbi);
-
-	return err;
 }
 
 static int ephmfs_get_tree(struct fs_context *fc)
@@ -984,14 +978,20 @@ static void ephmfs_kill_sb(struct super_block *sb)
 	struct ephmfs_dev_info *dev_info, *tmp;
 	struct ephmfs_sb_info *sbi = EMFS_SB(sb);
 
-	sysfs_remove_file(&sbi->sysfs_kobj, &ephmfs_devs_attr.attr);
-	kobject_put(&sbi->sysfs_kobj);
-
 	/*
 	 * Must evict inodes before freeing the dev_info structures because
 	 * eviction releases each inode's pages back into dev_info.
 	 */
 	kill_anon_super(sb);
+
+	/*
+	 * kill_sb is still called if fill_super failed, so we have to guard
+	 * against sbi being NULL.
+	 */
+	if (!sbi)
+		return;
+
+	kobject_put(&sbi->sysfs_kobj);
 
 	/* Free all dax device info structures */
 	list_for_each_entry_safe(dev_info, tmp, &sbi->dax_devs, node) {
