@@ -988,8 +988,8 @@ static void ephmfs_kill_sb(struct super_block *sb)
 static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 	struct dax_device *dax_dev, struct ephmfs_sb_info *sbi)
 {
-	int ret = 0;
 	long num_base_pages;
+	long num_pages;
 	int dax_lock_id;
 	long i;
 
@@ -1010,24 +1010,19 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 		pr_err("EphMFS: Failed to access dax device for block device\n");
 		return num_base_pages < 0 ? num_base_pages : -EIO;
 	}
-
-	// TODO: this will need to be updated when we start supporting more
-	// than just base pages.
-	dev_info->num_pages = num_base_pages;
-	dev_info->free_pages = num_base_pages;
-	dev_info->revoked_pages = 0;
+	num_pages = num_base_pages / (sbi->page_size / PAGE_SIZE);
 
 	INIT_LIST_HEAD(&dev_info->free_list);
 	INIT_LIST_HEAD(&dev_info->active_list);
 	spin_lock_init(&dev_info->lock);
 
-	dev_info->pages = vcalloc(dev_info->num_pages, sizeof(struct ephmfs_page));
+	dev_info->pages = vcalloc(num_pages, sizeof(struct ephmfs_page));
 	if (!dev_info->pages) {
 		pr_err("EphMFS: Failed to allocate ephmfs_page structures for dax device\n");
 		return -ENOMEM;
 	}
 	/* Initially place all pages on the free list */
-	for (i = 0; i < dev_info->num_pages; i++) {
+	for (i = 0; i < num_pages; i++) {
 		struct ephmfs_page *page = &dev_info->pages[i];
 		page->page_num = i;
 		page->inode = NULL;
@@ -1037,7 +1032,11 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 		spin_lock_init(&page->lock);
 		list_add(&page->node, &dev_info->free_list);
 	}
-	return ret;
+	dev_info->num_pages = num_pages;
+	dev_info->free_pages = num_pages;
+	dev_info->revoked_pages = 0;
+
+	return 0;
 }
 
 static int ephmfs_kill_procs(struct inode *inode, loff_t index, loff_t count, short lsb, int mf_flags)
@@ -1181,7 +1180,8 @@ out_path_put:
 	return err;
 }
 
-static struct dax_device *fs_dax_get_by_path(char *path, void *holder, const struct dax_holder_operations *ops)
+static int ephmfs_attach_dax_device(char *path, struct ephmfs_sb_info *sbi,
+	struct ephmfs_dev_info *dev_info)
 {
 	struct dax_device *dax_dev;
 	dev_t devno;
@@ -1190,22 +1190,34 @@ static struct dax_device *fs_dax_get_by_path(char *path, void *holder, const str
 	err = lookup_daxdev(path, &devno);
 	if (err) {
 		pr_err("EphMFS: Failed to lookup dax device by path %s (err=%d)\n", path, err);
-		return ERR_PTR(err);
+		return err;
 	}
 
 	dax_dev = dax_dev_get(devno);
 	if (!dax_dev) {
 		pr_err("EphMFS: Failed to get dax device for devno %llu\n", (unsigned long long)devno);
-		return ERR_PTR(-ENODEV);
+		return -ENODEV;
 	}
 
-	err = fs_dax_get(dax_dev, holder, ops);
+	err = ephmfs_populate_dev_info(dev_info, dax_dev, sbi);
+	if (err) {
+		pr_err("EphMFS: Failed to populate device info for devno %llu (err=%d)\n", (unsigned long long)devno, err);
+		goto put_dax_dev;
+	}
+
+	err = fs_dax_get(dax_dev, dev_info, &ephmfs_dax_holder_ops);
 	if (err) {
 		pr_err("EphMFS: Failed to get dax device for devno %llu (err=%d)\n", (unsigned long long)devno, err);
-		return ERR_PTR(err);
+		goto put_dax_dev;
 	}
 
-	return dax_dev;
+	return 0;
+
+put_dax_dev:
+	vfree(dev_info->pages);
+	dev_info->pages = NULL;
+	fs_put_dax(dax_dev, dev_info);
+	return err;
 }
 
 static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
@@ -1213,7 +1225,6 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 	char *dev_name;
 	struct ephmfs_sb_info *sbi;
 	struct ephmfs_dev_info *dev_info;
-	struct dax_device *dax_dev;
 	int err;
 
 	dev_name = kmalloc(count + 1, GFP_KERNEL);
@@ -1243,17 +1254,10 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 	}
 	dev_info->dev_name = dev_name;
 
-	dax_dev = fs_dax_get_by_path(dev_name, dev_info, &ephmfs_dax_holder_ops);
-	if (IS_ERR(dax_dev)) {
-		pr_err("EphMFS: Failed to open dax device for %s\n", dev_name);
-		err = PTR_ERR(dax_dev);
-		goto free_dev_info;
-	}
-
-	err = ephmfs_populate_dev_info(dev_info, dax_dev, sbi);
+	err = ephmfs_attach_dax_device(dev_name, sbi, dev_info);
 	if (err) {
-		pr_err("EphMFS: Failed to populate device info for %s (err=%d)\n", dev_name, err);
-		goto put_dax_dev;
+		pr_err("EphMFS: Failed to open dax device for %s\n", dev_name);
+		goto free_dev_info;
 	}
 
 	list_add(&dev_info->node, &sbi->dax_devs);
@@ -1262,8 +1266,6 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 
 	return count;
 
-put_dax_dev:
-	fs_put_dax(dax_dev, dev_info);
 free_dev_info:
 	kfree(dev_info);
 unlock:
