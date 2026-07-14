@@ -241,10 +241,6 @@ static struct ephmfs_page *ephmfs_alloc_and_insert_page(struct ephmfs_sb_info *s
 	if (!new_page)
 		return ERR_PTR(-ENOSPC);
 
-	/* Record the file offset and inode before publishing the page into the tree. */
-	new_page->page_offset = page_offset;
-	new_page->inode = inode_info->inode;
-
 	/* Make sure a racing thread hasn't beat us to the punch */
 	spin_lock(&inode_info->lock);
 	page = mtree_load(&inode_info->mt, page_offset);
@@ -254,6 +250,11 @@ static struct ephmfs_page *ephmfs_alloc_and_insert_page(struct ephmfs_sb_info *s
 		return page;
 	}
 
+	/* Record the file offset and inode before publishing the page into the tree. */
+	spin_lock(&new_page->lock);
+	new_page->page_offset = page_offset;
+	new_page->inode = inode_info->inode;
+	spin_unlock(&new_page->lock);
 	ret = mtree_insert(&inode_info->mt, page_offset, new_page, GFP_ATOMIC);
 	spin_unlock(&inode_info->lock);
 	if (ret) {
