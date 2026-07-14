@@ -840,23 +840,29 @@ static int ephmfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 static void ephmfs_evict_inode(struct inode *inode)
 {
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+	struct ephmfs_page *page;
+	unsigned long index = 0;
+
 	dax_break_layout_final(inode);
 	truncate_inode_pages_final(&inode->i_data);
+
+	/*
+	 * Free pages here rather than in free_inode because this runs
+	 * sequentially with the removal of the inode, while free_inode is
+	 * deferred.
+	 */
+	spin_lock(&info->lock);
+	mt_for_each(&info->mt, page, index, ULONG_MAX)
+		ephmfs_free_page(page);
+	spin_unlock(&info->lock);
+
 	clear_inode(inode);
 }
 
 static void ephmfs_free_inode(struct inode *inode)
 {
 	struct ephmfs_inode_info *info = EMFS_INODE(inode);
-	struct ephmfs_page *page;
-	unsigned long index = 0;
-
-	spin_lock(&info->lock);
-
-	mt_for_each(&info->mt, page, index, ULONG_MAX)
-		ephmfs_free_page(page);
-
-	spin_unlock(&info->lock);
 
 	mtree_destroy(&info->mt);
 	if (info->owner)
@@ -972,6 +978,12 @@ static void ephmfs_kill_sb(struct super_block *sb)
 	sysfs_remove_file(&sbi->sysfs_kobj, &ephmfs_devs_attr.attr);
 	kobject_put(&sbi->sysfs_kobj);
 
+	/*
+	 * Must evict inodes before freeing the dev_info structures because
+	 * eviction releases each inode's pages back into dev_info.
+	 */
+	kill_anon_super(sb);
+
 	/* Free all dax device info structures */
 	list_for_each_entry_safe(dev_info, tmp, &sbi->dax_devs, node) {
 		list_del(&dev_info->node);
@@ -981,7 +993,6 @@ static void ephmfs_kill_sb(struct super_block *sb)
 		kfree(dev_info);
 	}
 	kfree(sbi);
-	kill_anon_super(sb);
 }
 
 // Populates dev_info with the information from the dax device represented by bdev_file.
