@@ -1220,6 +1220,7 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 	if (!dev_name)
 		return -ENOMEM;
 	strncpy(dev_name, buf, count);
+	dev_name[count] = '\0';
 	if (dev_name[count - 1] == '\n')
 		dev_name[count - 1] = '\0';
 	pr_err("EphMFS: Adding device %s\n", dev_name);
