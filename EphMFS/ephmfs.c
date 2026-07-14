@@ -1211,6 +1211,12 @@ static int ephmfs_attach_dax_device(char *path, struct ephmfs_sb_info *sbi,
 		goto put_dax_dev;
 	}
 
+	/*
+	 * dax_dev_get and fs_dax_get both take a reference to dax_dev, so drop
+	 * one now.
+	 */
+	put_dax(dax_dev);
+
 	return 0;
 
 put_dax_dev:
