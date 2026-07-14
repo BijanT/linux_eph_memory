@@ -856,6 +856,7 @@ static void ephmfs_evict_inode(struct inode *inode)
 	mt_for_each(&info->mt, page, index, ULONG_MAX)
 		ephmfs_free_page(page);
 	spin_unlock(&info->lock);
+	mtree_destroy(&info->mt);
 
 	clear_inode(inode);
 }
@@ -864,10 +865,10 @@ static void ephmfs_free_inode(struct inode *inode)
 {
 	struct ephmfs_inode_info *info = EMFS_INODE(inode);
 
-	mtree_destroy(&info->mt);
 	if (info->owner)
 		put_task_struct(info->owner);
 	kfree(info);
+	free_inode_nonrcu(inode);
 }
 
 static int ephmfs_show_options(struct seq_file *m, struct dentry *root)
