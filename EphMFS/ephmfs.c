@@ -717,16 +717,18 @@ const struct address_space_operations ephmfs_aops = {
 
 static struct inode *ephmfs_get_inode(struct super_block *sb, const struct inode *dir, umode_t mode, dev_t dev)
 {
-	struct inode *inode = new_inode(sb);
+	struct inode *inode;
 	struct ephmfs_inode_info *info;
-	if (!inode)
-		return NULL;
 
 	info = kzalloc(sizeof(struct ephmfs_inode_info), GFP_KERNEL);
-	if (!info) {
-		iput(inode);
+	if (!info)
+		return NULL;
+	inode = new_inode(sb);
+	if (!inode) {
+		kfree(info);
 		return NULL;
 	}
+
 	info->inode = inode;
 	info->owner = NULL;
 	info->base_addr = 0;
@@ -753,6 +755,8 @@ static struct inode *ephmfs_get_inode(struct super_block *sb, const struct inode
 		inc_nlink(inode);
 		break;
 	default:
+		/* Don't need to kfree info because that will happen in free_inode */
+		iput(inode);
 		return NULL;
 	}
 
