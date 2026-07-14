@@ -615,13 +615,17 @@ static long ephmfs_fallocate(struct file *file, int mode, loff_t offset, loff_t 
 	}
 
 	// Allocate pages for the desired range
+	filemap_invalidate_lock_shared(inode->i_mapping);
 	for (off = offset; off < offset + len; off += sbi->page_size) {
 		u64 page_offset = off >> page_shift;
 
 		page = ephmfs_alloc_and_insert_page(sbi, info, page_offset, NULL);
-		if (IS_ERR(page))
+		if (IS_ERR(page)) {
+			filemap_invalidate_unlock_shared(inode->i_mapping);
 			return PTR_ERR(page);
+		}
 	}
+	filemap_invalidate_unlock_shared(inode->i_mapping);
 
 	return 0;
 }
