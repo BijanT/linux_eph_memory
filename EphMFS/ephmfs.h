@@ -3,6 +3,7 @@
 
 #include <linux/kobject.h>
 #include <linux/maple_tree.h>
+#include <linux/rwsem.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 
@@ -60,7 +61,7 @@ struct ephmfs_sb_info {
 	u64 page_size;
 	struct kobject sysfs_kobj;
 	struct list_head dax_devs;
-	rwlock_t lock;
+	struct rw_semaphore lock;
 };
 
 struct ephmfs_inode_info {
