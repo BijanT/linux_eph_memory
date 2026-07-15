@@ -59,6 +59,7 @@ struct ephmfs_page {
 
 struct ephmfs_sb_info {
 	u64 page_size;
+	bool attempt_ioctl;
 	struct kobject sysfs_kobj;
 	struct list_head dax_devs;
 	struct rw_semaphore lock;

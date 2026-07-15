@@ -15,8 +15,10 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
+#include <linux/seq_file.h>
 #include <linux/spinlock.h>
 #include <linux/statfs.h>
+#include <linux/string_choices.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
 #include <asm/asm.h>
@@ -426,6 +428,7 @@ static vm_fault_t ephmfs_huge_fault(struct vm_fault *vmf, unsigned int order)
 {
 	struct inode *inode = file_inode(vmf->vma->vm_file);
 	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+	struct ephmfs_sb_info *sbi = EMFS_SB(inode->i_sb);
 	bool in_attempt;
 	vm_fault_t result = 0;
 	unsigned long pfn;
@@ -439,8 +442,12 @@ static vm_fault_t ephmfs_huge_fault(struct vm_fault *vmf, unsigned int order)
 	spin_lock(&info->lock);
 	in_attempt = info->attempt_count > 0;
 	spin_unlock(&info->lock);
-	/* If we're not in the attempt context, we shouldn't be faulting in this page */
-	if (in_attempt)
+	/*
+	 * If we care about being in the attempt context for access, but we're
+	 * not, then cause a SIGSEGV to indicate an illegal access. Otherwise,
+	 * proceed as normal.
+	 */
+	if (in_attempt || !READ_ONCE(sbi->attempt_ioctl))
 		result = dax_iomap_fault(vmf, order, &pfn, NULL, &ephmfs_iomap_ops);
 	else
 		result = VM_FAULT_SIGSEGV;
@@ -526,6 +533,10 @@ out_unlock:
 static long ephmfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct inode *inode = file_inode(file);
+	struct ephmfs_sb_info *sbi = EMFS_SB(inode->i_sb);
+
+	if (!READ_ONCE(sbi->attempt_ioctl))
+		return -ENOTTY;
 
 	switch (cmd) {
 	case EPHMFS_IOCTL_ATTEMPT_ON:
@@ -881,6 +892,10 @@ static void ephmfs_free_inode(struct inode *inode)
 
 static int ephmfs_show_options(struct seq_file *m, struct dentry *root)
 {
+	struct ephmfs_sb_info *sbi = EMFS_SB(root->d_sb);
+	bool attempt_ioctl = READ_ONCE(sbi->attempt_ioctl);
+
+	seq_printf(m, ",attempt_ioctl=%s", str_true_false(attempt_ioctl));
 	return 0;
 }
 
@@ -892,8 +907,33 @@ static const struct super_operations ephmfs_ops = {
 	.show_options = ephmfs_show_options,
 };
 
+enum ephmfs_param {
+	Opt_attempt_ioctl,
+};
+
+static const struct fs_parameter_spec ephmfs_fs_parameters[] = {
+	fsparam_bool("attempt_ioctl", Opt_attempt_ioctl),
+	{}
+};
+
 static int ephmfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 {
+	struct fs_parse_result result;
+	bool *attempt_ioctl = fc->fs_private;
+	int opt;
+
+	opt = fs_parse(fc, ephmfs_fs_parameters, param, &result);
+	if (opt < 0)
+		return opt;
+
+	switch (opt) {
+	case Opt_attempt_ioctl:
+		*attempt_ioctl = result.boolean;
+		break;
+	default:
+		return -EINVAL;
+	}
+
 	return 0;
 }
 
@@ -913,6 +953,7 @@ static int ephmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_fs_info = sbi;
 
 	sbi->page_size = PAGE_SIZE;
+	sbi->attempt_ioctl = *(bool *)fc->fs_private;
 	/*
 	 * Proactive warning for when we allow different page sizes, since a
 	 * the chunk size being less than the page size could be problematic
@@ -959,17 +1000,36 @@ static int ephmfs_get_tree(struct fs_context *fc)
 
 static void ephmfs_free_fc(struct fs_context *fc)
 {
+	kfree(fc->fs_private);
+}
+
+static int ephmfs_reconfigure(struct fs_context *fc)
+{
+	struct ephmfs_sb_info *sbi = EMFS_SB(fc->root->d_sb);
+	bool attempt_ioctl = *(bool *)fc->fs_private;
+
+	WRITE_ONCE(sbi->attempt_ioctl, attempt_ioctl);
+	return 0;
 }
 
 static const struct fs_context_operations ephmfs_context_ops = {
 	.parse_param = ephmfs_parse_param,
 	.get_tree = ephmfs_get_tree,
 	.free = ephmfs_free_fc,
+	.reconfigure = ephmfs_reconfigure,
 };
 
 static int ephmfs_init_fs_context(struct fs_context *fc)
 {
 	fc->ops = &ephmfs_context_ops;
+	fc->fs_private = kmalloc(sizeof(bool), GFP_KERNEL);
+	if (!fc->fs_private)
+		return -ENOMEM;
+	if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE)
+		*(bool *)fc->fs_private = EMFS_SB(fc->root->d_sb)->attempt_ioctl;
+	else
+		/* Default for attempt_ioctl is false */
+		*(bool *)fc->fs_private = false;
 	return 0;
 }
 
