@@ -2124,12 +2124,6 @@ void bpf_prog_disassoc_struct_ops(struct bpf_prog *prog);
 void *bpf_prog_get_assoc_struct_ops(const struct bpf_prog_aux *aux);
 u32 bpf_struct_ops_id(const void *kdata);
 
-int bpf_fault_ops_link_create(union bpf_attr *attr);
-int bpf_fault_ops_link_writeprotect(union bpf_attr *attr);
-int bpf_fault_ops_link_add_region(union bpf_attr *attr);
-int bpf_fault_ops_link_remove_region(union bpf_attr *attr);
-int bpf_fault_ops_link_claim(union bpf_attr *attr);
-
 #ifdef CONFIG_NET
 /* Define it here to avoid the use of forward declaration */
 struct bpf_dummy_ops_state {
@@ -2187,6 +2181,26 @@ static inline void *bpf_prog_get_assoc_struct_ops(const struct bpf_prog_aux *aux
 	return NULL;
 }
 
+static inline void bpf_map_struct_ops_info_fill(struct bpf_map_info *info, struct bpf_map *map)
+{
+}
+
+static inline void bpf_struct_ops_desc_release(struct bpf_struct_ops_desc *st_ops_desc)
+{
+}
+
+#endif
+
+#ifdef CONFIG_BPF_FAULT
+
+int bpf_fault_ops_link_create(union bpf_attr *attr);
+int bpf_fault_ops_link_writeprotect(union bpf_attr *attr);
+int bpf_fault_ops_link_add_region(union bpf_attr *attr);
+int bpf_fault_ops_link_remove_region(union bpf_attr *attr);
+int bpf_fault_ops_link_claim(union bpf_attr *attr);
+
+#else /* CONFIG_BPF_FAULT */
+
 static inline int bpf_fault_ops_link_create(union bpf_attr *attr)
 {
 	return -EOPNOTSUPP;
@@ -2212,15 +2226,7 @@ static inline int bpf_fault_ops_link_claim(union bpf_attr *attr)
 	return -EOPNOTSUPP;
 }
 
-static inline void bpf_map_struct_ops_info_fill(struct bpf_map_info *info, struct bpf_map *map)
-{
-}
-
-static inline void bpf_struct_ops_desc_release(struct bpf_struct_ops_desc *st_ops_desc)
-{
-}
-
-#endif
+#endif /* CONFIG_BPF_FAULT */
 
 static inline int bpf_fsession_cnt(struct bpf_tramp_links *links)
 {
