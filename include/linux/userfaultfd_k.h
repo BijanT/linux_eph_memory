@@ -444,6 +444,28 @@ static inline vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 	return VM_FAULT_SIGBUS;
 }
 
+static inline void bpf_fault_fork_notify(struct task_struct *child) {}
+
+static inline bool bpf_fault_missing(struct vm_area_struct *vma)
+{
+	return false;
+}
+
+static inline bool bpf_fault_set(struct vm_area_struct *vma)
+{
+	return false;
+}
+
+static inline bool bpf_fault_wp(struct vm_area_struct *vma)
+{
+	return false;
+}
+
+static inline bool bpf_fault_pte_wp(struct vm_area_struct *vma, pte_t pte)
+{
+	return false;
+}
+
 static inline struct bpf_fault_ctx *bpf_fault_ctx_alloc(void)
 {
 	return NULL;
