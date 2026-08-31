@@ -1948,6 +1948,12 @@ union bpf_attr {
 #define BPF_FAULT_REGISTER	(1U << 1)
 #define BPF_FAULT_UNREGISTER	(1U << 2)
 #define BPF_FAULT_CLAIM		(1U << 3)
+#define BPF_FAULT_WAKE		(1U << 4)
+
+struct bpf_fault_msg {
+	__u64	address;
+	__u64   real_address;
+};
 
 /* The description below is an attempt at providing documentation to eBPF
  * developers about the multiple available eBPF helper functions. It can be

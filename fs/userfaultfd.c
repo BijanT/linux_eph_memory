@@ -359,17 +359,6 @@ out:
 	return ret;
 }
 
-static inline unsigned int userfaultfd_get_blocking_state(unsigned int flags)
-{
-	if (flags & FAULT_FLAG_INTERRUPTIBLE)
-		return TASK_INTERRUPTIBLE;
-
-	if (flags & FAULT_FLAG_KILLABLE)
-		return TASK_KILLABLE;
-
-	return TASK_UNINTERRUPTIBLE;
-}
-
 /*
  * The locking rules involved in returning VM_FAULT_RETRY depending on
  * FAULT_FLAG_ALLOW_RETRY, FAULT_FLAG_RETRY_NOWAIT and

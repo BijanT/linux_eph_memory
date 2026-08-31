@@ -52,6 +52,14 @@ struct bpf_fault_ctx {
 	struct mm_struct *mm;
 	/* bpf link attached to this bpf_fault_ctx */
 	struct bpf_fault_ops_link *prog;
+	/*
+	 * Wait queue for threads waiting for condition before retrying fault.
+	 */
+	wait_queue_head_t fault_waiter_wqh;
+	/* Wait queue for threads polling for fault notifications. */
+	wait_queue_head_t pollers_wqh;
+	/* Generation counter for wakeups. */
+	atomic_t wake_gen;
 };
 static inline bool bpf_fault_set(struct vm_area_struct *vma)
 {
@@ -619,4 +627,16 @@ static inline bool pte_swp_uffd_wp_any(pte_t pte)
 	return false;
 }
 #endif /* CONFIG_USERFAULTFD */
+
+static inline unsigned int userfaultfd_get_blocking_state(unsigned int flags)
+{
+	if (flags & FAULT_FLAG_INTERRUPTIBLE)
+		return TASK_INTERRUPTIBLE;
+
+	if (flags & FAULT_FLAG_KILLABLE)
+		return TASK_KILLABLE;
+
+	return TASK_UNINTERRUPTIBLE;
+}
+
 #endif /* _LINUX_USERFAULTFD_K_H */

@@ -747,8 +747,14 @@ struct bpf_fault_fork_info {
 	__u32 child_pid;            /* tgid of the new child */
 };
 
+typedef enum bpf_fault_ret {
+	BPF_FAULT_RET_SUCCESS = 0,	/* fault handled successfully */
+	BPF_FAULT_RET_SIGBUS = 1,	/* send SIGBUS to the faulting process */
+	BPF_FAULT_RET_WAIT = 2,		/* The thread must wait and retry later */
+} bpf_fault_ret_t;
+
 struct fault_ops {
-	int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx,
+	bpf_fault_ret_t (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx,
 				 unsigned char *page);
 	int (*handle_wp_fault)(struct bpf_fault_ops_ctx *ctx,
 			       unsigned char *page);

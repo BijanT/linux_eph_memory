@@ -566,6 +566,9 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc(void)
 	ctx->fork_notified = false;
 	ctx->prog = NULL;
 	ctx->mm = current->mm;
+	init_waitqueue_head(&ctx->fault_waiter_wqh);
+	init_waitqueue_head(&ctx->pollers_wqh);
+	atomic_set(&ctx->wake_gen, 0);
 	mmgrab(ctx->mm);
 
 	return ctx;
@@ -1255,10 +1258,10 @@ static int bpf_fault_validate(void *kdata)
 	return 0;
 }
 
-static int __bpf_fault_handle_page_fault(struct bpf_fault_ops_ctx *ctx,
+static bpf_fault_ret_t __bpf_fault_handle_page_fault(struct bpf_fault_ops_ctx *ctx,
 					 unsigned char *page)
 {
-	return 0;
+	return BPF_FAULT_RET_SUCCESS;
 }
 
 static int __bpf_fault_handle_wp_fault(struct bpf_fault_ops_ctx *ctx,
