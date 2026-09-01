@@ -35,6 +35,12 @@
  */
 #define UFFD_SHARED_FCNTL_FLAGS (O_CLOEXEC | O_NONBLOCK)
 
+/*
+ * Lock ordering from highest priority to lowest
+ * pollers_wqh.lock
+ * fault_pending_wqh.lock
+ * fault_wqh.lock
+ */
 struct bpf_fault_ctx {
 	/* pseudo fd refcounting */
 	refcount_t refcount;
@@ -53,9 +59,11 @@ struct bpf_fault_ctx {
 	/* bpf link attached to this bpf_fault_ctx */
 	struct bpf_fault_ops_link *prog;
 	/*
-	 * Wait queue for threads waiting for condition before retrying fault.
+	 * Wait queue for threads waiting, but not yet alerted to userspace.
 	 */
-	wait_queue_head_t fault_waiter_wqh;
+	wait_queue_head_t fault_pending_wqh;
+	/* Wait queue for threads that have alerted userspace. */
+	wait_queue_head_t fault_wqh;
 	/* Wait queue for threads polling for fault notifications. */
 	wait_queue_head_t pollers_wqh;
 	/* Generation counter for wakeups. */

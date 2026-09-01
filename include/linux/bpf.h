@@ -10,6 +10,7 @@
 #include <crypto/sha2.h>
 #include <linux/workqueue.h>
 #include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/percpu.h>
 #include <linux/err.h>
 #include <linux/rbtree_latch.h>
@@ -1871,6 +1872,7 @@ struct bpf_link_ops {
 			      struct bpf_link_info *info);
 	int (*update_map)(struct bpf_link *link, struct bpf_map *new_map,
 			  struct bpf_map *old_map);
+	ssize_t (*read_iter)(struct kiocb *iocb, struct iov_iter *iter);
 	__poll_t (*poll)(struct file *file, struct poll_table_struct *pts);
 };
 
@@ -2198,6 +2200,11 @@ int bpf_fault_ops_link_writeprotect(union bpf_attr *attr);
 int bpf_fault_ops_link_add_region(union bpf_attr *attr);
 int bpf_fault_ops_link_remove_region(union bpf_attr *attr);
 int bpf_fault_ops_link_claim(union bpf_attr *attr);
+
+struct bpf_fault_wait_queue {
+	struct bpf_fault_msg msg;
+	wait_queue_entry_t wq;
+};
 
 #else /* CONFIG_BPF_FAULT */
 

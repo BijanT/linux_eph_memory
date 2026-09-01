@@ -10,6 +10,7 @@
 #include <linux/btf.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/poll.h>
 #include <linux/userfaultfd_k.h>
 
 #include "bpf_struct_ops.h"
@@ -141,11 +142,136 @@ err_out:
 	return err;
 }
 
+static inline struct bpf_fault_wait_queue *find_bpf_fault(struct bpf_fault_ctx *ctx)
+{
+	wait_queue_entry_t *wq;
+	struct bpf_fault_wait_queue *bfwq;
+
+	lockdep_assert_held(&ctx->fault_pending_wqh.lock);
+
+	if (!waitqueue_active(&ctx->fault_pending_wqh))
+		return NULL;
+	/* walk in reverse to provide FIFO behavior to read faults */
+	wq = list_last_entry(&ctx->fault_pending_wqh.head, typeof(*wq), entry);
+	bfwq = container_of(wq, struct bpf_fault_wait_queue, wq);
+	return bfwq;
+}
+
+static ssize_t bpf_fault_ctx_read(struct bpf_fault_ctx *ctx, bool no_wait,
+			    struct bpf_fault_msg *msg)
+{
+	ssize_t ret;
+	DECLARE_WAITQUEUE(wait, current);
+	struct bpf_fault_wait_queue *bfwq;
+
+	spin_lock_irq(&ctx->pollers_wqh.lock);
+	__add_wait_queue(&ctx->pollers_wqh, &wait);
+	for (;;) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		spin_lock(&ctx->fault_pending_wqh.lock);
+		bfwq = find_bpf_fault(ctx);
+		if (bfwq) {
+			list_del(&bfwq->wq.entry);
+			add_wait_queue(&ctx->fault_wqh, &bfwq->wq);
+			*msg = bfwq->msg;
+			spin_unlock(&ctx->fault_pending_wqh.lock);
+			ret = 0;
+			break;
+		}
+
+		spin_unlock(&ctx->fault_pending_wqh.lock);
+		if (READ_ONCE(ctx->released)) {
+			ret = -ENODEV;
+			break;
+		}
+		if (signal_pending(current)) {
+			ret = -ERESTARTSYS;
+			break;
+		}
+		if (no_wait) {
+			ret = -EAGAIN;
+			break;
+		}
+
+		/* Nothing for us just yet. Wait until there is. */
+		spin_unlock_irq(&ctx->pollers_wqh.lock);
+		schedule();
+		spin_lock_irq(&ctx->pollers_wqh.lock);
+	}
+
+	__remove_wait_queue(&ctx->pollers_wqh, &wait);
+	__set_current_state(TASK_RUNNING);
+	spin_unlock_irq(&ctx->pollers_wqh.lock);
+	return ret;
+}
+
+static ssize_t bpf_fault_ops_link_read_iter(struct kiocb *iocb,
+					    struct iov_iter *iter)
+{
+	struct file *file = iocb->ki_filp;
+	struct bpf_link *link = file->private_data;
+	struct bpf_fault_ops_link *st_link;
+	struct bpf_fault_ctx *ctx;
+	struct bpf_fault_msg msg;
+	ssize_t _ret, ret = 0;
+	bool no_wait;
+
+	st_link = container_of(link, struct bpf_fault_ops_link, link);
+	ctx = st_link->ctx;
+	if (!ctx)
+		return -EINVAL;
+
+	no_wait = file->f_flags & O_NONBLOCK || iocb->ki_flags & IOCB_NOWAIT;
+	for (;;) {
+		if (iov_iter_count(iter) < sizeof(msg))
+			return ret ? ret : -EINVAL;
+		_ret = bpf_fault_ctx_read(ctx, no_wait, &msg);
+		if (_ret < 0)
+			return ret ? ret : _ret;
+		_ret = !copy_to_iter_full(&msg, sizeof(msg), iter);
+		if (_ret)
+			return ret ? ret : -EFAULT;
+		ret += sizeof(msg);
+		/*
+		 * Allow to read more than one fault at time but only
+		 * block if waiting for the very first one.
+		 */
+		no_wait = true;
+	}
+}
+
+static __poll_t bpf_fault_ops_link_poll(struct file *file,
+				  struct poll_table_struct *pts)
+{
+	struct bpf_link *link = file->private_data;
+	struct bpf_fault_ops_link *st_link;
+	struct bpf_fault_ctx *ctx;
+	__poll_t ret = 0;
+
+	st_link = container_of(link, struct bpf_fault_ops_link, link);
+	ctx = st_link->ctx;
+	if (!ctx)
+		return EPOLLERR;
+
+	poll_wait(file, &ctx->pollers_wqh, pts);
+
+	smp_mb();
+	/* Are there any pending faults? */
+	if (waitqueue_active(&ctx->fault_pending_wqh))
+		ret = EPOLLIN;
+	if (READ_ONCE(ctx->released))
+		ret |= EPOLLHUP;
+
+	return ret;
+}
+
 static const struct bpf_link_ops bpf_fault_ops_link_lops = {
 	.dealloc = bpf_fault_ops_link_dealloc,
 	.show_fdinfo = bpf_fault_ops_link_show_fdinfo,
 	.fill_link_info = bpf_fault_ops_link_fill_link_info,
 	.update_map = bpf_fault_ops_link_update,
+	.read_iter = bpf_fault_ops_link_read_iter,
+	.poll = bpf_fault_ops_link_poll,
 };
 
 int bpf_fault_ops_link_create(union bpf_attr *attr)

@@ -18,6 +18,7 @@
 #include <linux/mm.h>
 #include <linux/mm_types.h>
 #include <linux/pagemap.h>
+#include <linux/poll.h>
 #include <linux/rmap.h>
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
@@ -30,6 +31,35 @@ static struct kmem_cache *bpf_fault_ctx_cachep __ro_after_init;
 
 static const struct btf_type *bpf_fault_ops_ctx_type;
 static const struct btf_type *bpf_fault_fork_info_type;
+
+/* Inspired by userfaultfd_wake_function */
+static int bpf_fault_wake_function(wait_queue_entry_t *wq, unsigned mode,
+				   int flags, void *key)
+{
+	struct range *range = key;
+	struct bpf_fault_wait_queue *bfwq;
+	u64 start;
+	u64 end;
+	int ret;
+
+	if (!range) {
+		WARN_ONCE(1, "bpf_fault_wake_function called with NULL range");
+		return 0;
+	}
+
+	bfwq = container_of(wq, struct bpf_fault_wait_queue, wq);
+
+	start = range->start;
+	end = range->end;
+	if (start > bfwq->msg.address || end < bfwq->msg.address)
+		return 0;
+
+	ret = wake_up_state(wq->private, mode);
+	if (ret)
+		list_del_init(&wq->entry);
+
+	return ret;
+}
 
 static pmd_t *bpf_fault_alloc_pmd(struct mm_struct *mm, unsigned long address)
 {
@@ -253,7 +283,10 @@ out_no_page:
 	if (folio)
 		folio_put(folio);
 
-	if (err) {
+	if (err != BPF_FAULT_RET_SUCCESS) {
+		if (err == BPF_FAULT_RET_WAIT) {
+			pr_warn_once("BPF_FAULT_RET_WAIT returned from handle_wp_fault() is not supported\n");
+		}
 		/*
 		 * The fault lock was already released above, so we
 		 * cannot return VM_FAULT_SIGBUS (the caller would
@@ -321,11 +354,15 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	struct address_space *mapping = NULL;
 	struct fault_ops *ops;
 	struct folio *folio = NULL;
+	struct bpf_fault_wait_queue bfwq;
 	unsigned long address = vmf->address;
+	unsigned int blocking_state;
 	pmd_t *dst_pmd;
 	pmd_t dst_pmdval;
 	void *kaddr;
+	int generation;
 	int err;
+	bool inherited_ctx;
 
 	/*
 	 * We don't do userfault handling for the final child pid update
@@ -432,6 +469,13 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	ops_ctx.real_address = vmf->real_address;
 	ops_ctx.fault_type = BPF_FAULT_MISSING;
 
+	/*
+	 * Used to defend against race condition where waiting threads are woken
+	 * after this fault has decided to wait and we've enqueued this thread
+	 * to the wait queue, but before we've gone to sleep, causing this
+	 * thread to sleep an unbounded amount of time.
+	 */
+	generation = atomic_read(&ctx->wake_gen);
 	rcu_read_lock();
 	ops = bpf_fault_ops_map(ctx->prog);
 	err = ops->handle_page_fault(&ops_ctx, kaddr);
@@ -439,7 +483,55 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 
 	kunmap_local(kaddr);
 
-	if (err) {
+	/*
+	 * We don't wait on inherited contexts because they don't have their
+	 * own file descriptor with which they would read and wake up faulting
+	 * threads.
+	 * The complete fix would be to send a message to userspace alerting it
+	 * of the fork, and informing it of a new fd to listen to. However,
+	 * since we will only use this functionality in QEMU, we can punt on
+	 * that for now.
+	 */
+	inherited_ctx = READ_ONCE(ctx->inherited);
+	if (err == BPF_FAULT_RET_WAIT && !inherited_ctx) {
+		/* Free the folio before waiting */
+		folio_put(folio);
+
+		init_waitqueue_func_entry(&bfwq.wq, bpf_fault_wake_function);
+		bfwq.wq.private = current;
+		bfwq.msg = (struct bpf_fault_msg) {
+			.address = vmf->address,
+			.real_address = vmf->real_address,
+		};
+
+		blocking_state = userfaultfd_get_blocking_state(vmf->flags);
+
+		spin_lock_irq(&ctx->fault_pending_wqh.lock);
+		__add_wait_queue(&ctx->fault_pending_wqh, &bfwq.wq);
+		set_current_state(blocking_state);
+		spin_unlock_irq(&ctx->fault_pending_wqh.lock);
+
+		if (generation == atomic_read(&ctx->wake_gen) &&
+		    !READ_ONCE(ctx->released)) {
+			wake_up_poll(&ctx->pollers_wqh, EPOLLIN);
+			schedule();
+		}
+
+		__set_current_state(TASK_RUNNING);
+
+		if (!list_empty_careful(&bfwq.wq.entry)) {
+			spin_lock_irq(&ctx->fault_pending_wqh.lock);
+			list_del_init(&bfwq.wq.entry);
+			spin_unlock_irq(&ctx->fault_pending_wqh.lock);
+		}
+
+		goto out_put_ctx;
+	} else if (err != BPF_FAULT_RET_SUCCESS) {
+		if (err == BPF_FAULT_RET_WAIT && inherited_ctx)
+			pr_warn_once("BPF_FAULT_RET_WAIT returned from handle_page_fault() is not supported for inherited contexts\n");
+		else if (err != BPF_FAULT_RET_SIGBUS)
+			pr_warn_ratelimited("bpf_fault: unexpected return %d from handle_page_fault\n",
+					    err);
 		/*
 		 * The fault lock was already released above, so we
 		 * cannot return VM_FAULT_SIGBUS (the caller would
@@ -566,7 +658,8 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc(void)
 	ctx->fork_notified = false;
 	ctx->prog = NULL;
 	ctx->mm = current->mm;
-	init_waitqueue_head(&ctx->fault_waiter_wqh);
+	init_waitqueue_head(&ctx->fault_pending_wqh);
+	init_waitqueue_head(&ctx->fault_wqh);
 	init_waitqueue_head(&ctx->pollers_wqh);
 	atomic_set(&ctx->wake_gen, 0);
 	mmgrab(ctx->mm);
@@ -602,6 +695,10 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc_for_mm(struct mm_struct *mm,
 	ctx->parent_link_id = 0;
 	ctx->fork_notified = false;
 	ctx->mm = mm;
+	init_waitqueue_head(&ctx->fault_pending_wqh);
+	init_waitqueue_head(&ctx->fault_wqh);
+	init_waitqueue_head(&ctx->pollers_wqh);
+	atomic_set(&ctx->wake_gen, 0);
 	mmgrab(mm);
 	ctx->prog = child_link;
 
@@ -1127,6 +1224,8 @@ static struct vm_area_struct *bpf_fault_clear_vma(struct vma_iterator *vmi,
 void bpf_fault_release_all(struct bpf_fault_ctx *ctx)
 {
 	struct mm_struct *mm;
+	/* Full range wakes everything */
+	struct range wake_range = {0, U64_MAX};
 
 	if (!ctx)
 		return;
@@ -1136,6 +1235,16 @@ void bpf_fault_release_all(struct bpf_fault_ctx *ctx)
 	VMA_ITERATOR(vmi, mm, 0);
 
 	WRITE_ONCE(ctx->released, true);
+
+	/*
+	 * Wake up any waiters
+	 */
+	atomic_inc(&ctx->wake_gen);
+	spin_lock_irq(&ctx->fault_pending_wqh.lock);
+	__wake_up_locked_key(&ctx->fault_pending_wqh, TASK_NORMAL, &wake_range);
+	__wake_up(&ctx->fault_wqh, TASK_NORMAL, 0, &wake_range);
+	spin_unlock_irq(&ctx->fault_pending_wqh.lock);
+	wake_up_poll(&ctx->pollers_wqh, EPOLLHUP);
 
 	if (!mmget_not_zero(mm))
 		return;

@@ -1950,9 +1950,14 @@ union bpf_attr {
 #define BPF_FAULT_CLAIM		(1U << 3)
 #define BPF_FAULT_WAKE		(1U << 4)
 
+/*
+ * struct bpf_fault_msg should be designed to allow it to grow without
+ * breaking compatibility, but for this research project, we don't need to
+ * worry about that. Leave it as a simple struct for now.
+ */
 struct bpf_fault_msg {
-	__u64 address;
-	__u64 real_address;
+	__u64	address;
+	__u64	real_address;
 };
 
 /* The description below is an attempt at providing documentation to eBPF

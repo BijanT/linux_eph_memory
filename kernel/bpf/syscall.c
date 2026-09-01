@@ -1036,8 +1036,18 @@ static void bpf_map_show_fdinfo(struct seq_file *m, struct file *filp)
 }
 #endif
 
-static ssize_t bpf_dummy_read(struct file *filp, char __user *buf, size_t siz,
-			      loff_t *ppos)
+static ssize_t bpf_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct bpf_link *link = iocb->ki_filp->private_data;
+
+	if (link->ops->read_iter)
+		return link->ops->read_iter(iocb, iter);
+
+	return -EINVAL;
+}
+
+static ssize_t bpf_dummy_read(struct file *filp, char __user *buf,
+			      size_t siz, loff_t *ppos)
 {
 	/* We need this handler such that alloc_file() enables
 	 * f_mode with FMODE_CAN_READ.
@@ -3402,7 +3412,7 @@ static const struct file_operations bpf_link_fops_poll = {
 	.show_fdinfo	= bpf_link_show_fdinfo,
 #endif
 	.release	= bpf_link_release,
-	.read		= bpf_dummy_read,
+	.read_iter	= bpf_read_iter,
 	.write		= bpf_dummy_write,
 	.poll		= bpf_link_poll,
 };
