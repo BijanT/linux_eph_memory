@@ -54,8 +54,10 @@ static void bpf_fault_ops_link_dealloc(struct bpf_link *link)
 		bpf_map_put(&st_map->map);
 	}
 
-	bpf_fault_release_all(st_link->ctx);
-	bpf_fault_ctx_put(st_link->ctx);
+	if (st_link->ctx) {
+		bpf_fault_release_all(st_link->ctx);
+		bpf_fault_ctx_put(st_link->ctx);
+	}
 	kfree(st_link);
 }
 
