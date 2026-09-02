@@ -13860,6 +13860,22 @@ int bpf_link__fault_claim(int parent_link_fd)
 					&attr, attr_sz));
 }
 
+int bpf_link__fault_wake(int link_fd, __u64 start, __u64 len)
+{
+	const size_t attr_sz = offsetofend(union bpf_attr, link_fault_cmd);
+	union bpf_attr attr;
+	int ret;
+
+	memset(&attr, 0, attr_sz);
+	attr.link_fault_cmd.link_fd = link_fd;
+	attr.link_fault_cmd.flags = BPF_FAULT_WAKE;
+	attr.link_fault_cmd.start = start;
+	attr.link_fault_cmd.len = len;
+
+	ret = syscall(__NR_bpf, BPF_LINK_FAULT_OPS_CMD, &attr, attr_sz);
+	return libbpf_err_errno(ret);
+}
+
 typedef enum bpf_perf_event_ret (*bpf_perf_event_print_t)(struct perf_event_header *hdr,
 							  void *private_data);
 
