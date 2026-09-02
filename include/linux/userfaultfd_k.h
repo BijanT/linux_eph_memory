@@ -95,12 +95,14 @@ vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf);
 struct fault_ops *bpf_fault_ops_map(struct bpf_fault_ops_link *link);
 struct bpf_fault_ctx *bpf_fault_ctx_alloc(void);
 void bpf_fault_ctx_free(struct bpf_fault_ctx *ctx);
+void bpf_fault_ctx_get(struct bpf_fault_ctx *ctx);
 void bpf_fault_ctx_put(struct bpf_fault_ctx *ctx);
 int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len, __u32 flags);
 int bpf_fault_add_region(struct bpf_fault_ctx *ctx, __u64 start, __u64 len);
 int bpf_fault_unregister(struct bpf_fault_ctx *ctx, __u64 start, __u64 len);
 int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
 		       unsigned long len, bool enable_wp, bool lock);
+int bpf_fault_wake(struct bpf_fault_ctx *ctx, __u64 start, __u64 len);
 void bpf_fault_release_all(struct bpf_fault_ctx *ctx);
 
 #ifdef CONFIG_BPF_FAULT

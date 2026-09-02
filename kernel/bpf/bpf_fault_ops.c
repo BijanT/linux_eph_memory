@@ -569,6 +569,43 @@ out_put_parent:
 }
 
 /*
+ * Wake up bpf_fault threads waiting to finish a page fault.
+ * This is a no-op if there are no waiters.
+ */
+int bpf_fault_ops_link_wake(union bpf_attr *attr)
+{
+	struct bpf_fault_ops_link *st_link;
+	struct bpf_fault_ctx *ctx;
+	struct bpf_link *link;
+	int err;
+
+	link = bpf_link_get_from_fd(attr->link_fault_cmd.link_fd);
+	if (IS_ERR(link))
+		return PTR_ERR(link);
+
+	if (link->type != BPF_LINK_TYPE_FAULT_OPS) {
+		err = -EINVAL;
+		goto out_put_link;
+	}
+
+	st_link = container_of(link, struct bpf_fault_ops_link, link);
+	ctx = st_link->ctx;
+	if (!ctx) {
+		err = -EINVAL;
+		goto out_put_link;
+	}
+	bpf_fault_ctx_get(ctx);
+
+	err = bpf_fault_wake(ctx,
+			     attr->link_fault_cmd.start,
+			     attr->link_fault_cmd.len);
+	bpf_fault_ctx_put(ctx);
+out_put_link:
+	bpf_link_put(link);
+	return err;
+}
+
+/*
  * Allocate a lightweight link for a fork-inherited bpf_fault context.
  * Shares the parent's struct_ops map via bpf_map_inc().  The returned
  * link has no bpf_link lifecycle (no fd, no bpf_link_init) — only the

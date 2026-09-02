@@ -61,6 +61,16 @@ static int bpf_fault_wake_function(wait_queue_entry_t *wq, unsigned mode,
 	return ret;
 }
 
+static void bpf_fault_wake_waiters(struct bpf_fault_ctx *ctx,
+				     struct range *range)
+{
+	atomic_inc(&ctx->wake_gen);
+	spin_lock_irq(&ctx->fault_pending_wqh.lock);
+	__wake_up_locked_key(&ctx->fault_pending_wqh, TASK_NORMAL, range);
+	__wake_up(&ctx->fault_wqh, TASK_NORMAL, 0, range);
+	spin_unlock_irq(&ctx->fault_pending_wqh.lock);
+}
+
 static pmd_t *bpf_fault_alloc_pmd(struct mm_struct *mm, unsigned long address)
 {
 	pgd_t *pgd;
@@ -159,7 +169,7 @@ static void bpf_fault_unlock_vma(struct vm_area_struct *vma)
 
 #endif /* CONFIG_PER_VMA_LOCK */
 
-static void bpf_fault_ctx_get(struct bpf_fault_ctx *ctx)
+void bpf_fault_ctx_get(struct bpf_fault_ctx *ctx)
 {
 	refcount_inc(&ctx->refcount);
 }
@@ -1213,11 +1223,7 @@ void bpf_fault_release_all(struct bpf_fault_ctx *ctx)
 	/*
 	 * Wake up any waiters
 	 */
-	atomic_inc(&ctx->wake_gen);
-	spin_lock_irq(&ctx->fault_pending_wqh.lock);
-	__wake_up_locked_key(&ctx->fault_pending_wqh, TASK_NORMAL, &wake_range);
-	__wake_up(&ctx->fault_wqh, TASK_NORMAL, 0, &wake_range);
-	spin_unlock_irq(&ctx->fault_pending_wqh.lock);
+	bpf_fault_wake_waiters(ctx, &wake_range);
 	wake_up_poll(&ctx->pollers_wqh, EPOLLHUP);
 
 	if (!mmget_not_zero(mm))
@@ -1420,6 +1426,20 @@ int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
 		mmap_read_unlock(mm);
 	mmput(mm);
 	return err;
+}
+
+int bpf_fault_wake(struct bpf_fault_ctx *ctx, __u64 start, __u64 len)
+{
+	unsigned long end = start + len;
+	/* -1 because range is inclusive */
+	struct range wake_range = {start, end - 1};
+
+	if (bpf_fault_validate_range(ctx->mm, start, len))
+		return -EINVAL;
+
+	bpf_fault_wake_waiters(ctx, &wake_range);
+
+	return 0;
 }
 
 /*

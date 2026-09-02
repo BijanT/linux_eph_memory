@@ -2200,6 +2200,7 @@ int bpf_fault_ops_link_writeprotect(union bpf_attr *attr);
 int bpf_fault_ops_link_add_region(union bpf_attr *attr);
 int bpf_fault_ops_link_remove_region(union bpf_attr *attr);
 int bpf_fault_ops_link_claim(union bpf_attr *attr);
+int bpf_fault_ops_link_wake(union bpf_attr *attr);
 
 struct bpf_fault_wait_queue {
 	struct bpf_fault_msg msg;
@@ -2229,6 +2230,11 @@ static inline int bpf_fault_ops_link_remove_region(union bpf_attr *attr)
 }
 
 static inline int bpf_fault_ops_link_claim(union bpf_attr *attr)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int bpf_fault_ops_link_wake(union bpf_attr *attr)
 {
 	return -EOPNOTSUPP;
 }
