@@ -326,7 +326,6 @@ int bpf_fault_ops_link_create(union bpf_attr *attr)
 						&link->link);
 	if (err) {
 		mutex_unlock(&fault_update_mutex);
-		bpf_fault_ctx_free(link->ctx);
 		bpf_link_cleanup(&link_primer);
 		link = NULL;
 		goto err_out;
