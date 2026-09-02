@@ -100,7 +100,7 @@ int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len, __u32 
 int bpf_fault_add_region(struct bpf_fault_ctx *ctx, __u64 start, __u64 len);
 int bpf_fault_unregister(struct bpf_fault_ctx *ctx, __u64 start, __u64 len);
 int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
-		       unsigned long len, bool enable_wp);
+		       unsigned long len, bool enable_wp, bool lock);
 void bpf_fault_release_all(struct bpf_fault_ctx *ctx);
 
 #ifdef CONFIG_BPF_FAULT

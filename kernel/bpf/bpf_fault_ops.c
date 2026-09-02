@@ -394,7 +394,8 @@ int bpf_fault_ops_link_writeprotect(union bpf_attr *attr)
 	err = bpf_fault_wp_range(ctx->mm,
 				 attr->link_fault_cmd.start,
 				 attr->link_fault_cmd.len,
-				 enable_wp);
+				 enable_wp,
+				 true);
 
 out_put_link:
 	bpf_link_put(link);

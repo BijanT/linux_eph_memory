@@ -269,6 +269,7 @@ out_no_page:
 	ops_ctx.address = vmf->address;
 	ops_ctx.real_address = vmf->real_address;
 	ops_ctx.fault_type = BPF_FAULT_WP;
+	ops_ctx.mmap_lock_held = false;
 
 	rcu_read_lock();
 	ops = bpf_fault_ops_map(ctx->prog);
@@ -363,6 +364,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	int generation;
 	int err;
 	bool inherited_ctx;
+	bool fault_lock_held = true;
 
 	/*
 	 * We don't do userfault handling for the final child pid update
@@ -370,6 +372,17 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	 */
 	if (current->flags & (PF_EXITING | PF_DUMPCORE))
 		goto out;
+
+	/*
+	 * We don't support FAULT_FLAG_VMA_LOCK because the bpf helper
+	 * bpf_fault_writeprotect() can be called from inside the BPF program
+	 * and takes the mmap_lock, which should only be taken before the vma
+	 * lock.
+	 */
+	if (vmf->flags & FAULT_FLAG_VMA_LOCK) {
+		ret = VM_FAULT_RETRY;
+		goto out_release_lock;
+	}
 
 	assert_fault_locked(vmf);
 
@@ -395,48 +408,21 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	}
 
 	/*
-	 * Handle nowait, not much to do other than tell it to retry
-	 * and wait.
-	 */
-	ret = VM_FAULT_RETRY;
-	if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
-		goto out;
-
-	/*
 	 * If it's already released don't get it.  This avoids looping
 	 * in __get_user_pages if the bpf_fault_ctx is being torn down.
-	 *
-	 * Use VM_FAULT_RETRY + release_fault_lock() rather than
-	 * VM_FAULT_NOPAGE, because faultin_page() does nothing special
-	 * on NOPAGE and GUP would spin retrying without releasing the
-	 * mmap read lock, causing a possible livelock.
 	 */
 	if (unlikely(READ_ONCE(ctx->released))) {
-		release_fault_lock(vmf);
-		goto out;
+		ret = VM_FAULT_RETRY;
+		goto out_release_lock;
 	}
 
-	/* Take the reference before dropping the mmap_lock */
 	bpf_fault_ctx_get(ctx);
 
 	/*
-	 * Save the mapping before dropping the lock.  After
-	 * release_fault_lock() the VMA may be torn down by munmap(),
-	 * so we cannot touch vma->vm_ops or vma->vm_file afterwards.
-	 * vm_file holds a reference to the inode that keeps the
-	 * address_space alive independently of the VMA.
-	 */
-	if (vma->vm_ops && vma->vm_file)
-		mapping = vma->vm_file->f_mapping;
-
-	release_fault_lock(vmf);
-
-	/*
 	 * Allocate a zeroed folio for the BPF program to populate.
-	 * We use folio_alloc rather than vma_alloc_folio because the
-	 * mmap_lock has been released and the VMA may be gone.
 	 */
-	folio = folio_alloc(GFP_HIGHUSER_MOVABLE | __GFP_ZERO, 0);
+	folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE | __GFP_ZERO, 0, vma,
+				address);
 	if (!folio) {
 		ret = VM_FAULT_RETRY;
 		goto out_put_ctx;
@@ -448,11 +434,10 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	/*
 	 * For shmem/file-backed VMAs, pre-populate the page with existing
 	 * page cache contents so the BPF program sees the actual data.
-	 * We use the mapping pointer saved before release_fault_lock()
-	 * since the VMA may have been torn down by now.
 	 */
-	if (mapping) {
+	if (vma->vm_ops && vma->vm_file) {
 		struct folio *src;
+		mapping = vma->vm_file->f_mapping;
 
 		src = filemap_lock_folio(mapping, vmf->pgoff);
 		if (!IS_ERR(src)) {
@@ -468,6 +453,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	ops_ctx.address = vmf->address;
 	ops_ctx.real_address = vmf->real_address;
 	ops_ctx.fault_type = BPF_FAULT_MISSING;
+	ops_ctx.mmap_lock_held = !(vmf->flags & FAULT_FLAG_VMA_LOCK);
 
 	/*
 	 * Used to defend against race condition where waiting threads are woken
@@ -494,8 +480,17 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	 */
 	inherited_ctx = READ_ONCE(ctx->inherited);
 	if (err == BPF_FAULT_RET_WAIT && !inherited_ctx) {
+		ret = VM_FAULT_RETRY;
 		/* Free the folio before waiting */
 		folio_put(folio);
+
+		/*
+		 * If we can't wait, we should tell the caller to retry.
+		 * Also, the contract of FAULT_FLAG_RETRY_NOWAIT is that we
+		 * will not drop the fault lock, so skip to out_put_ctx.
+		 */
+		if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
+			goto out_put_ctx;
 
 		init_waitqueue_func_entry(&bfwq.wq, bpf_fault_wake_function);
 		bfwq.wq.private = current;
@@ -510,6 +505,10 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 		__add_wait_queue(&ctx->fault_pending_wqh, &bfwq.wq);
 		set_current_state(blocking_state);
 		spin_unlock_irq(&ctx->fault_pending_wqh.lock);
+
+		/* We're about to sleep, so drop the lock */
+		release_fault_lock(vmf);
+		fault_lock_held = false;
 
 		if (generation == atomic_read(&ctx->wake_gen) &&
 		    !READ_ONCE(ctx->released)) {
@@ -532,17 +531,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 		else if (err != BPF_FAULT_RET_SIGBUS)
 			pr_warn_ratelimited("bpf_fault: unexpected return %d from handle_page_fault\n",
 					    err);
-		/*
-		 * The fault lock was already released above, so we
-		 * cannot return VM_FAULT_SIGBUS (the caller would
-		 * double-release the VMA lock).  Deliver SIGBUS
-		 * directly and return RETRY so the caller skips its
-		 * own unlock and the signal is handled on return to
-		 * userspace.
-		 */
-		force_sig_fault(SIGBUS, BUS_ADRERR,
-				(void __user *)address);
-		ret = VM_FAULT_RETRY;
+		ret = VM_FAULT_SIGBUS;
 		goto out_put_folio;
 	}
 
@@ -555,57 +544,43 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	 */
 	__folio_mark_uptodate(folio);
 
-	/*
-	 * Re-acquire a lock to install the PTE.  bpf_fault_lock_vma()
-	 * uses per-VMA locking when available for scalability, falling
-	 * back to mmap_read_lock.  It also ensures anon_vma is allocated
-	 * (required by folio_add_new_anon_rmap's BUG_ON(!anon_vma)).
-	 */
-	vma = bpf_fault_lock_vma(mm, address);
-	if (IS_ERR(vma)) {
-		ret = VM_FAULT_RETRY;
-		goto out_put_folio;
-	}
-
-	if (!bpf_fault_missing(vma))
-		goto out_unlock;
-
+	if (anon_vma_prepare(vma))
+		goto out_retry;
 	if (mem_cgroup_charge(folio, mm, GFP_KERNEL))
-		goto out_unlock;
+		goto out_retry;
 
 	/* Walk page tables to find/allocate the PMD */
 	dst_pmd = bpf_fault_alloc_pmd(mm, address);
 	if (!dst_pmd)
-		goto out_unlock;
+		goto out_retry;
 
 	dst_pmdval = pmdp_get_lockless(dst_pmd);
 	if (unlikely(pmd_none(dst_pmdval)) &&
 	    unlikely(__pte_alloc(mm, dst_pmd)))
-		goto out_unlock;
+		goto out_retry;
 
 	dst_pmdval = pmdp_get_lockless(dst_pmd);
 	if (unlikely(!pmd_present(dst_pmdval) || pmd_trans_huge(dst_pmdval)))
-		goto out_unlock;
+		goto out_retry;
 
 	if (unlikely(pmd_bad(dst_pmdval)))
-		goto out_unlock;
+		goto out_retry;
 
 	err = mfill_atomic_install_pte(dst_pmd, vma, address,
 				       &folio->page,
 				       bpf_fault_wp(vma) ? MFILL_ATOMIC_WP : 0);
 
-	bpf_fault_unlock_vma(vma);
+	if (err)
+		goto out_retry;
 
-	if (err) {
-		folio_put(folio);
-		ret = VM_FAULT_RETRY;
-	} else if (can_complete) {
+	bpf_fault_ctx_put(ctx);
+	if (can_complete) {
 		/*
 		 * Direct callers (anon page faults, file-backed faults
-		 * from do_fault): PTE installed and VMA lock released.
-		 * Return COMPLETED so the arch fault code skips the
-		 * retry, avoiding a redundant VMA lookup + page table
-		 * walk just to find the PTE present.
+		 * from do_fault): PTE installed.
+		 * Return 0 so the arch fault code skips the retry, avoiding a
+		 * redundant VMA lookup + page table walk just to find the PTE
+		 * present.
 		 *
 		 * Callers nested inside filesystem fault handlers
 		 * (e.g. shmem_fault → __do_fault) must use RETRY
@@ -613,28 +588,27 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 		 * COMPLETED and would try to process a folio that
 		 * doesn't exist.
 		 */
-		ret = VM_FAULT_COMPLETED;
+		return 0;
 	} else {
 		ret = VM_FAULT_RETRY;
+		goto out_release_lock;
 	}
-	bpf_fault_ctx_put(ctx);
-	return ret;
 
-out_unlock:
-	bpf_fault_unlock_vma(vma);
-	/*
-	 * The original fault lock was released by release_fault_lock()
-	 * above.  We must return RETRY so the caller does not try to
-	 * release it a second time.  Transient errors (OOM, VMA race)
-	 * resolve naturally on the retry through the normal fault path.
-	 */
+out_retry:
 	ret = VM_FAULT_RETRY;
 out_put_folio:
 	folio_put(folio);
 out_put_ctx:
 	bpf_fault_ctx_put(ctx);
-	return ret;
-
+out_release_lock:
+	/*
+	 * If FAULT_FLAG_RETRY_NOWAIT is set, we should not drop the fault
+	 * lock. However, if it is not set, faultin_page() expects to lock to
+	 * be dropped on VM_FAULT_RETRY.
+	 */
+	if (!(vmf->flags & FAULT_FLAG_RETRY_NOWAIT) && fault_lock_held &&
+	    ret == VM_FAULT_RETRY)
+		release_fault_lock(vmf);
 out:
 	return ret;
 }
@@ -1394,7 +1368,7 @@ static struct fault_ops __bpf_fault_ops = {
  * bpf_fault WP.  Caller must not hold the mmap lock.
  */
 int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
-		       unsigned long len, bool enable_wp)
+		       unsigned long len, bool enable_wp, bool lock)
 {
 	unsigned long end = start + len;
 	unsigned long _start, _end;
@@ -1408,7 +1382,8 @@ int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
 	if (!mmget_not_zero(mm))
 		return -ESRCH;
 
-	mmap_read_lock(mm);
+	if (lock)
+		mmap_read_lock(mm);
 
 	err = -ENOENT;
 	for_each_vma_range(vmi, dst_vma, end) {
@@ -1441,7 +1416,8 @@ int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
 		err = 0;
 	}
 
-	mmap_read_unlock(mm);
+	if (lock)
+		mmap_read_unlock(mm);
 	mmput(mm);
 	return err;
 }
@@ -1450,15 +1426,15 @@ int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
  * BPF kfunc: apply or resolve write-protection on a page range.
  *
  * Called from a BPF struct_ops fault handler.  The faulting task's mmap
- * lock is not held on entry (handle_bpf_fault releases it before calling
- * the BPF program).
+ * lock may be held on entry depending on the context.
  */
 __bpf_kfunc_start_defs();
 
 __bpf_kfunc int bpf_fault_writeprotect(struct bpf_fault_ops_ctx *ctx,
 					__u64 start, __u64 len, bool enable_wp)
 {
-	return bpf_fault_wp_range(current->mm, start, len, enable_wp);
+	return bpf_fault_wp_range(current->mm, start, len, enable_wp,
+				  !ctx->mmap_lock_held);
 }
 
 __bpf_kfunc_end_defs();

@@ -740,6 +740,7 @@ struct bpf_fault_ops_ctx {
 	unsigned long address;      /* faulting virtual address - page aligned */
 	unsigned long real_address; /* faulting virtual address - exact */
 	__u32 fault_type;           /* BPF_FAULT_MISSING or BPF_FAULT_WP */
+	bool mmap_lock_held;	    /* true if mmap_lock is held */
 };
 
 struct bpf_fault_fork_info {
