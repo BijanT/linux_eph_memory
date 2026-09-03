@@ -1433,8 +1433,14 @@ int bpf_fault_wake(struct bpf_fault_ctx *ctx, __u64 start, __u64 len)
 	/* -1 because range is inclusive */
 	struct range wake_range = {start, end - 1};
 
-	if (bpf_fault_validate_range(ctx->mm, start, len))
-		return -EINVAL;
+	if (bpf_fault_validate_range(ctx->mm, start, len)) {
+		/*
+		 * Allow full range as "wake all", even though it would fail
+		 * bpf_fault_validate_range()
+		 */
+		if (start != 0 || len != U64_MAX)
+			return -EINVAL;
+	}
 
 	bpf_fault_wake_waiters(ctx, &wake_range);
 
