@@ -741,6 +741,7 @@ struct bpf_fault_ops_ctx {
 	unsigned long real_address; /* faulting virtual address - exact */
 	__u32 fault_type;           /* BPF_FAULT_MISSING or BPF_FAULT_WP */
 	bool mmap_lock_held;	    /* true if mmap_lock is held */
+	struct mm_struct *mm;       /* mm_struct of the faulting process */
 };
 
 struct bpf_fault_fork_info {

@@ -212,6 +212,8 @@ vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 	if (!ctx)
 		goto out;
 
+	VM_WARN_ON_ONCE(ctx->mm != mm);
+
 	if (unlikely(!(vmf->flags & FAULT_FLAG_ALLOW_RETRY)))
 		goto out;
 
@@ -280,6 +282,7 @@ out_no_page:
 	ops_ctx.real_address = vmf->real_address;
 	ops_ctx.fault_type = BPF_FAULT_WP;
 	ops_ctx.mmap_lock_held = false;
+	ops_ctx.mm = mm;
 
 	rcu_read_lock();
 	ops = bpf_fault_ops_map(ctx->prog);
@@ -464,6 +467,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	ops_ctx.real_address = vmf->real_address;
 	ops_ctx.fault_type = BPF_FAULT_MISSING;
 	ops_ctx.mmap_lock_held = !(vmf->flags & FAULT_FLAG_VMA_LOCK);
+	ops_ctx.mm = mm;
 
 	/*
 	 * Used to defend against race condition where waiting threads are woken
@@ -1114,13 +1118,8 @@ static int bpf_fault_btf_struct_access(struct bpf_verifier_log *log,
 
 	t = btf_type_by_id(reg->btf, reg->btf_id);
 	if (t == bpf_fault_ops_ctx_type) {
-		if (off + size > sizeof(struct bpf_fault_ops_ctx)) {
-			bpf_log(log,
-				"out of bounds access at off %d with size %d\n",
-				off, size);
-			return -EACCES;
-		}
-		return SCALAR_VALUE;
+		/* Don't allow writes to bpf_fault_ops_ctx at all */
+		return -EACCES;
 	}
 	if (t == bpf_fault_fork_info_type) {
 		if (off + size > sizeof(struct bpf_fault_fork_info)) {
@@ -1453,7 +1452,7 @@ __bpf_kfunc_start_defs();
 __bpf_kfunc int bpf_fault_writeprotect(struct bpf_fault_ops_ctx *ctx,
 					__u64 start, __u64 len, bool enable_wp)
 {
-	return bpf_fault_wp_range(current->mm, start, len, enable_wp,
+	return bpf_fault_wp_range(ctx->mm, start, len, enable_wp,
 				  !ctx->mmap_lock_held);
 }
 
