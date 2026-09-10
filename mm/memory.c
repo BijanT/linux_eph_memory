@@ -5381,7 +5381,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 		}
 		if (bpf_fault_missing(vma)) {
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
-			return handle_bpf_fault(vmf, true);
+			return handle_bpf_fault(vmf, 0, true);
 		}
 		if (vmf_orig_pte_uffd_wp(vmf))
 			entry = pte_mkuffd_wp(entry);
@@ -5409,7 +5409,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 						vmf->address, &vmf->ptl);
 		if (vmf->pte && !vmf_pte_changed(vmf)) {
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
-			return handle_bpf_fault(vmf, true);
+			return handle_bpf_fault(vmf, 0, true);
 		}
 		if (vmf->pte)
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
@@ -5458,7 +5458,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	if (bpf_fault_missing(vma)) {
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		folio_put(folio);
-		return handle_bpf_fault(vmf, true);
+		return handle_bpf_fault(vmf, 0, true);
 	}
 	map_anon_folio_pte_pf(folio, vmf->pte, vma, addr,
 			      vmf_orig_pte_uffd_wp(vmf));
@@ -6075,7 +6075,7 @@ static vm_fault_t do_bpf_fault_file(struct vm_fault *vmf)
 	folio_put(folio);
 	vmf->page = NULL;
 
-	return handle_bpf_fault(vmf, true);
+	return handle_bpf_fault(vmf, 0, true);
 }
 
 /*

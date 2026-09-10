@@ -180,6 +180,273 @@ void bpf_fault_ctx_put(struct bpf_fault_ctx *ctx)
 		bpf_fault_ctx_free(ctx);
 }
 
+static int bpf_fault_install_pte(struct vm_fault *vmf, struct folio *folio)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long address = vmf->address;
+	pmd_t *dst_pmd, dst_pmdval;
+
+	/* Walk page tables to find/allocate the PMD */
+	dst_pmd = bpf_fault_alloc_pmd(mm, address);
+	if (!dst_pmd)
+		return -ENOMEM;
+
+	dst_pmdval = pmdp_get_lockless(dst_pmd);
+	if (unlikely(pmd_none(dst_pmdval)) &&
+	    unlikely(__pte_alloc(mm, dst_pmd)))
+		return -ENOMEM;
+
+	dst_pmdval = pmdp_get_lockless(dst_pmd);
+	if (unlikely(!pmd_present(dst_pmdval) || pmd_trans_huge(dst_pmdval)))
+		return -EAGAIN;
+
+	if (unlikely(pmd_bad(dst_pmdval)))
+		return -EAGAIN;
+
+	return mfill_atomic_install_pte(dst_pmd, vma, address,
+					&folio->page,
+					bpf_fault_wp(vma) ? MFILL_ATOMIC_WP : 0);
+
+}
+
+static int bpf_fault_install_pmd(struct vm_fault *vmf, struct folio *folio)
+{
+	return -EOPNOTSUPP;
+}
+
+static int bpf_fault_install(struct vm_fault *vmf, struct folio *folio,
+			     int order)
+{
+	if (order == 0)
+		return bpf_fault_install_pte(vmf, folio);
+	else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && order == HPAGE_PMD_ORDER)
+		return bpf_fault_install_pmd(vmf, folio);
+	else
+		return -EOPNOTSUPP;
+}
+
+static bpf_fault_ret_t bpf_fault_call_handle_pf(struct vm_fault *vmf,
+						struct bpf_fault_ctx *ctx,
+						struct folio *folio,
+						int order)
+{
+	struct bpf_fault_ops_ctx ops_ctx = {
+		.address = vmf->address,
+		.real_address = vmf->real_address,
+		.fault_type = BPF_FAULT_MISSING,
+		.page_order = order,
+		.mmap_lock_held = !(vmf->flags & FAULT_FLAG_VMA_LOCK),
+		.mm = vmf->vma->vm_mm,
+	};
+	struct bpf_dynptr_kern dp;
+	struct fault_ops *ops;
+	bpf_fault_ret_t ret;
+
+	bpf_dynptr_init(&dp, folio_address(folio), BPF_DYNPTR_TYPE_LOCAL, 0,
+			folio_size(folio));
+
+	rcu_read_lock();
+	ops = bpf_fault_ops_map(ctx->prog);
+	ret = ops->handle_page_fault(&ops_ctx, (struct bpf_dynptr *)&dp);
+	rcu_read_unlock();
+
+	return ret;
+}
+
+static void bpf_fault_wait(struct vm_fault *vmf, struct bpf_fault_ctx *ctx,
+			   int generation, bool *fault_lock_held)
+{
+	struct bpf_fault_wait_queue bfwq;
+	unsigned int blocking_state;
+
+	init_waitqueue_func_entry(&bfwq.wq, bpf_fault_wake_function);
+	bfwq.wq.private = current;
+	bfwq.msg = (struct bpf_fault_msg) {
+		.address = vmf->address,
+		.real_address = vmf->real_address,
+	};
+
+	blocking_state = userfaultfd_get_blocking_state(vmf->flags);
+
+	spin_lock_irq(&ctx->fault_pending_wqh.lock);
+	__add_wait_queue(&ctx->fault_pending_wqh, &bfwq.wq);
+	set_current_state(blocking_state);
+	spin_unlock_irq(&ctx->fault_pending_wqh.lock);
+
+	/* We're about to sleep, so drop the lock */
+	release_fault_lock(vmf);
+	*fault_lock_held = false;
+
+	if (generation == atomic_read(&ctx->wake_gen) &&
+	    !READ_ONCE(ctx->released)) {
+		wake_up_poll(&ctx->pollers_wqh, EPOLLIN);
+		schedule();
+	}
+
+	__set_current_state(TASK_RUNNING);
+
+	if (!list_empty_careful(&bfwq.wq.entry)) {
+		spin_lock_irq(&ctx->fault_pending_wqh.lock);
+		list_del_init(&bfwq.wq.entry);
+		spin_unlock_irq(&ctx->fault_pending_wqh.lock);
+	}
+}
+
+/*
+ * Look up the page being write-protection faulted so the BPF program can
+ * read its current contents.  The page is present (this is a WP fault), so
+ * walk the page tables under the VMA lock and take a folio reference.
+ *
+ * Returns the folio with a reference held and *folio_off set to the byte
+ * offset of the faulting page within it, NULL if no page was found (e.g. a
+ * race with unregister), or an ERR_PTR if the VMA lock could not be taken
+ * (caller should return VM_FAULT_RETRY).
+ *
+ * mm is passed in (not read from vmf->vma) because the caller has already
+ * dropped the fault lock, so vmf->vma may no longer be valid.
+ */
+static struct folio *bpf_fault_wp_get_folio(struct vm_fault *vmf,
+					   struct mm_struct *mm,
+					   size_t *folio_off)
+{
+	unsigned long address = vmf->address;
+	struct vm_area_struct *vma;
+	struct folio *folio = NULL;
+
+	*folio_off = 0;
+
+	vma = bpf_fault_lock_vma(mm, address);
+	if (IS_ERR(vma))
+		return ERR_CAST(vma);
+
+	if (bpf_fault_wp(vma)) {
+		pmd_t *pmd;
+		pte_t *ptep, pte;
+		spinlock_t *ptl;
+		struct page *page;
+
+		pmd = bpf_fault_alloc_pmd(mm, address);
+		if (!pmd)
+			goto out;
+
+		ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+		if (!ptep)
+			goto out;
+
+		pte = ptep_get(ptep);
+		if (pte_present(pte)) {
+			page = vm_normal_page(vma, address, pte);
+			if (page) {
+				folio = page_folio(page);
+				*folio_off = folio_page_idx(folio, page) *
+					     PAGE_SIZE;
+				folio_get(folio);
+			}
+		}
+		pte_unmap_unlock(ptep, ptl);
+	}
+out:
+	bpf_fault_unlock_vma(vma);
+	return folio;
+}
+
+/*
+ * Build a read-only dynptr over the faulting page and invoke the BPF
+ * handle_wp_fault callback.  If the page-table walk failed (no folio) the
+ * program gets a zero-length dynptr rather than NULL, so reads simply
+ * return -EINVAL.  Read-only-ness is enforced only at runtime (the verifier
+ * has no read-only dynptr view).
+ *
+ * Returns the callback's return value: BPF_FAULT_RET_SUCCESS to allow the
+ * write, non-zero (or -ENOSYS with no callback) to deny it.
+ */
+static int bpf_fault_call_handle_wp(struct vm_fault *vmf,
+				    struct bpf_fault_ctx *ctx,
+				    struct mm_struct *mm,
+				    struct folio *folio, size_t folio_off)
+{
+	struct bpf_fault_ops_ctx ops_ctx = {
+		.address = vmf->address,
+		.real_address = vmf->real_address,
+		.fault_type = BPF_FAULT_WP,
+		/* WP faults are PTE-granular; the dynptr spans one page. */
+		.page_order = 0,
+		.mmap_lock_held = false,
+		.mm = mm,
+	};
+	struct bpf_dynptr_kern dp;
+	struct fault_ops *ops;
+	int ret;
+
+	if (folio)
+		bpf_dynptr_init(&dp, folio_address(folio) + folio_off,
+				BPF_DYNPTR_TYPE_LOCAL, 0, PAGE_SIZE);
+	else
+		bpf_dynptr_init(&dp, NULL, BPF_DYNPTR_TYPE_LOCAL, 0, 0);
+	bpf_dynptr_set_rdonly(&dp);
+
+	rcu_read_lock();
+	ops = bpf_fault_ops_map(ctx->prog);
+	if (ops->handle_wp_fault)
+		ret = ops->handle_wp_fault(&ops_ctx, (struct bpf_dynptr *)&dp);
+	else
+		ret = -ENOSYS;
+	rcu_read_unlock();
+
+	return ret;
+}
+
+/*
+ * Resolve a PTE-level uffd-wp marker after the BPF program allowed the
+ * write: re-acquire the VMA lock, re-walk the page tables, and clear the
+ * uffd-wp bit so the retried fault finds the PTE writable.
+ */
+static int bpf_fault_wp_resolve_pte(struct vm_fault *vmf, struct mm_struct *mm)
+{
+	unsigned long address = vmf->address;
+	struct vm_area_struct *vma;
+	pmd_t *pmd;
+	pte_t *ptep, pte;
+	spinlock_t *ptl;
+
+	vma = bpf_fault_lock_vma(mm, address);
+	if (IS_ERR(vma))
+		return PTR_ERR(vma);
+
+	if (!bpf_fault_wp(vma))
+		goto out;
+
+	pmd = bpf_fault_alloc_pmd(mm, address);
+	if (!pmd)
+		goto out;
+
+	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+	if (!ptep)
+		goto out;
+
+	pte = ptep_get(ptep);
+	if (pte_present(pte) && pte_uffd_wp(pte)) {
+		pte = pte_clear_uffd_wp(pte);
+		set_pte_at(mm, address, ptep, pte);
+	}
+	pte_unmap_unlock(ptep, ptl);
+out:
+	bpf_fault_unlock_vma(vma);
+	return 0;
+}
+
+static int bpf_fault_wp_resolve(struct vm_fault *vmf, struct mm_struct *mm)
+{
+	/*
+	 * Only PTE-level uffd-wp markers exist today.  PMD-mapped THP WP
+	 * faults go through do_huge_pmd_wp_page(), which has no bpf_fault
+	 * hook, so nothing PMD-level reaches here yet; a bpf_fault_wp_resolve_pmd()
+	 * split is added along with that hook in a later change.
+	 */
+	return bpf_fault_wp_resolve_pte(vmf, mm);
+}
+
 /*
  * Handle a write-protection fault on a bpf_fault WP-registered VMA.
  *
@@ -194,15 +461,12 @@ void bpf_fault_ctx_put(struct bpf_fault_ctx *ctx)
 vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 {
 	struct bpf_fault_ctx *ctx;
-	struct bpf_fault_ops_ctx ops_ctx;
 	vm_fault_t ret = VM_FAULT_SIGBUS;
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long address = vmf->address;
 	struct folio *folio = NULL;
 	size_t folio_off = 0;
-	struct fault_ops *ops;
-	void *kaddr;
 	int err;
 
 	if (current->flags & (PF_EXITING | PF_DUMPCORE))
@@ -231,123 +495,34 @@ vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 
 	release_fault_lock(vmf);
 
-	/*
-	 * Look up the existing page so the BPF program can read its
-	 * contents.  The page is present (this is a WP fault), so walk
-	 * the page tables under VMA lock to get a folio reference.
-	 */
-	vma = bpf_fault_lock_vma(mm, address);
-	if (IS_ERR(vma)) {
+	folio = bpf_fault_wp_get_folio(vmf, mm, &folio_off);
+	if (IS_ERR(folio)) {
 		ret = VM_FAULT_RETRY;
 		goto out_put_ctx;
 	}
 
-	if (bpf_fault_wp(vma)) {
-		pmd_t *pmd;
-		pte_t *ptep, pte;
-		spinlock_t *ptl;
-		struct page *page;
+	err = bpf_fault_call_handle_wp(vmf, ctx, mm, folio, folio_off);
 
-		pmd = bpf_fault_alloc_pmd(mm, address);
-		if (!pmd)
-			goto out_no_page;
-
-		ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
-		if (!ptep)
-			goto out_no_page;
-
-		pte = ptep_get(ptep);
-		if (pte_present(pte)) {
-			page = vm_normal_page(vma, address, pte);
-			if (page) {
-				folio = page_folio(page);
-				folio_off = folio_page_idx(folio, page) *
-					    PAGE_SIZE;
-				folio_get(folio);
-			}
-		}
-		pte_unmap_unlock(ptep, ptl);
-	}
-
-out_no_page:
-	bpf_fault_unlock_vma(vma);
-
-	if (folio)
-		kaddr = kmap_local_folio(folio, folio_off);
-	else
-		kaddr = NULL;
-
-	/* Set up BPF context and call the WP fault handler */
-	ops_ctx.address = vmf->address;
-	ops_ctx.real_address = vmf->real_address;
-	ops_ctx.fault_type = BPF_FAULT_WP;
-	ops_ctx.mmap_lock_held = false;
-	ops_ctx.mm = mm;
-
-	rcu_read_lock();
-	ops = bpf_fault_ops_map(ctx->prog);
-	if (ops->handle_wp_fault)
-		err = ops->handle_wp_fault(&ops_ctx, kaddr);
-	else
-		err = -ENOSYS;
-	rcu_read_unlock();
-
-	if (kaddr)
-		kunmap_local(kaddr);
 	if (folio)
 		folio_put(folio);
 
 	if (err != BPF_FAULT_RET_SUCCESS) {
-		if (err == BPF_FAULT_RET_WAIT) {
+		if (err == BPF_FAULT_RET_WAIT)
 			pr_warn_once("BPF_FAULT_RET_WAIT returned from handle_wp_fault() is not supported\n");
-		}
 		/*
-		 * The fault lock was already released above, so we
-		 * cannot return VM_FAULT_SIGBUS (the caller would
-		 * double-release the VMA lock).  Deliver SIGBUS
-		 * directly and return RETRY so the caller skips its
-		 * own unlock and the signal is handled on return to
-		 * userspace.
+		 * The fault lock was already released above, so we cannot
+		 * return VM_FAULT_SIGBUS (the caller would double-release the
+		 * VMA lock).  Deliver SIGBUS directly and return RETRY so the
+		 * caller skips its own unlock and the signal is handled on
+		 * return to userspace.
 		 */
-		force_sig_fault(SIGBUS, BUS_ADRERR,
-				(void __user *)address);
+		force_sig_fault(SIGBUS, BUS_ADRERR, (void __user *)address);
 		ret = VM_FAULT_RETRY;
 		goto out_put_ctx;
 	}
 
-	/*
-	 * BPF program allowed the write.  Re-acquire a lock and clear
-	 * the uffd-wp bit on the PTE to resolve the write protection.
-	 */
-	vma = bpf_fault_lock_vma(mm, address);
-	if (IS_ERR(vma)) {
-		ret = VM_FAULT_RETRY;
-		goto out_put_ctx;
-	}
-
-	if (bpf_fault_wp(vma)) {
-		pmd_t *pmd;
-		pte_t *ptep, pte;
-		spinlock_t *ptl;
-
-		pmd = bpf_fault_alloc_pmd(mm, address);
-		if (!pmd)
-			goto out_unlock;
-
-		ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
-		if (!ptep)
-			goto out_unlock;
-
-		pte = ptep_get(ptep);
-		if (pte_present(pte) && pte_uffd_wp(pte)) {
-			pte = pte_clear_uffd_wp(pte);
-			set_pte_at(mm, address, ptep, pte);
-		}
-		pte_unmap_unlock(ptep, ptl);
-	}
-
-out_unlock:
-	bpf_fault_unlock_vma(vma);
+	/* BPF program allowed the write; resolve the write-protection marker. */
+	bpf_fault_wp_resolve(vmf, mm);
 	ret = VM_FAULT_RETRY;
 
 out_put_ctx:
@@ -358,21 +533,15 @@ out:
 	return ret;
 }
 
-vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
+vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 {
 	struct bpf_fault_ctx *ctx;
-	struct bpf_fault_ops_ctx ops_ctx;
 	vm_fault_t ret = VM_FAULT_SIGBUS;
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	struct address_space *mapping = NULL;
-	struct fault_ops *ops;
 	struct folio *folio = NULL;
-	struct bpf_fault_wait_queue bfwq;
 	unsigned long address = vmf->address;
-	unsigned int blocking_state;
-	pmd_t *dst_pmd;
-	pmd_t dst_pmdval;
 	void *kaddr;
 	int generation;
 	int err;
@@ -434,15 +603,19 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	/*
 	 * Allocate a zeroed folio for the BPF program to populate.
 	 */
-	folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE | __GFP_ZERO, 0, vma,
+	folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE | __GFP_ZERO, order, vma,
 				address);
 	if (!folio) {
-		ret = VM_FAULT_RETRY;
+		ret = (order == 0) ? VM_FAULT_RETRY : VM_FAULT_FALLBACK;
 		goto out_put_ctx;
 	}
 
-	/* Map the folio into kernel space for the BPF program */
-	kaddr = kmap_local_folio(folio, 0);
+	/*
+	 * Kernel address of the folio for the dynptr / page-cache prefill.
+	 * bpf_fault depends on 64BIT (no highmem), so folio_address() is
+	 * always valid and spans the whole folio contiguously.
+	 */
+	kaddr = folio_address(folio);
 
 	/*
 	 * For shmem/file-backed VMAs, pre-populate the page with existing
@@ -462,13 +635,6 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 		}
 	}
 
-	/* Set up BPF context and call the program */
-	ops_ctx.address = vmf->address;
-	ops_ctx.real_address = vmf->real_address;
-	ops_ctx.fault_type = BPF_FAULT_MISSING;
-	ops_ctx.mmap_lock_held = !(vmf->flags & FAULT_FLAG_VMA_LOCK);
-	ops_ctx.mm = mm;
-
 	/*
 	 * Used to defend against race condition where waiting threads are woken
 	 * after this fault has decided to wait and we've enqueued this thread
@@ -476,12 +642,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	 * thread to sleep an unbounded amount of time.
 	 */
 	generation = atomic_read(&ctx->wake_gen);
-	rcu_read_lock();
-	ops = bpf_fault_ops_map(ctx->prog);
-	err = ops->handle_page_fault(&ops_ctx, kaddr);
-	rcu_read_unlock();
-
-	kunmap_local(kaddr);
+	err = bpf_fault_call_handle_pf(vmf, ctx, folio, order);
 
 	/*
 	 * We don't wait on inherited contexts because they don't have their
@@ -497,6 +658,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 		ret = VM_FAULT_RETRY;
 		/* Free the folio before waiting */
 		folio_put(folio);
+		folio = NULL;
 
 		/*
 		 * If we can't wait, we should tell the caller to retry.
@@ -506,38 +668,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 		if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
 			goto out_put_ctx;
 
-		init_waitqueue_func_entry(&bfwq.wq, bpf_fault_wake_function);
-		bfwq.wq.private = current;
-		bfwq.msg = (struct bpf_fault_msg) {
-			.address = vmf->address,
-			.real_address = vmf->real_address,
-		};
-
-		blocking_state = userfaultfd_get_blocking_state(vmf->flags);
-
-		spin_lock_irq(&ctx->fault_pending_wqh.lock);
-		__add_wait_queue(&ctx->fault_pending_wqh, &bfwq.wq);
-		set_current_state(blocking_state);
-		spin_unlock_irq(&ctx->fault_pending_wqh.lock);
-
-		/* We're about to sleep, so drop the lock */
-		release_fault_lock(vmf);
-		fault_lock_held = false;
-
-		if (generation == atomic_read(&ctx->wake_gen) &&
-		    !READ_ONCE(ctx->released)) {
-			wake_up_poll(&ctx->pollers_wqh, EPOLLIN);
-			schedule();
-		}
-
-		__set_current_state(TASK_RUNNING);
-
-		if (!list_empty_careful(&bfwq.wq.entry)) {
-			spin_lock_irq(&ctx->fault_pending_wqh.lock);
-			list_del_init(&bfwq.wq.entry);
-			spin_unlock_irq(&ctx->fault_pending_wqh.lock);
-		}
-
+		bpf_fault_wait(vmf, ctx, generation, &fault_lock_held);
 		goto out_put_ctx;
 	} else if (err != BPF_FAULT_RET_SUCCESS) {
 		if (err == BPF_FAULT_RET_WAIT && inherited_ctx)
@@ -563,30 +694,15 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	if (mem_cgroup_charge(folio, mm, GFP_KERNEL))
 		goto out_retry;
 
-	/* Walk page tables to find/allocate the PMD */
-	dst_pmd = bpf_fault_alloc_pmd(mm, address);
-	if (!dst_pmd)
+	err = bpf_fault_install(vmf, folio, order);
+	if (err == -EOPNOTSUPP) {
+		ret = VM_FAULT_FALLBACK;
+		goto out_put_folio;
+	} else if (err) {
 		goto out_retry;
+	}
 
-	dst_pmdval = pmdp_get_lockless(dst_pmd);
-	if (unlikely(pmd_none(dst_pmdval)) &&
-	    unlikely(__pte_alloc(mm, dst_pmd)))
-		goto out_retry;
-
-	dst_pmdval = pmdp_get_lockless(dst_pmd);
-	if (unlikely(!pmd_present(dst_pmdval) || pmd_trans_huge(dst_pmdval)))
-		goto out_retry;
-
-	if (unlikely(pmd_bad(dst_pmdval)))
-		goto out_retry;
-
-	err = mfill_atomic_install_pte(dst_pmd, vma, address,
-				       &folio->page,
-				       bpf_fault_wp(vma) ? MFILL_ATOMIC_WP : 0);
-
-	if (err)
-		goto out_retry;
-
+	folio = NULL;
 	bpf_fault_ctx_put(ctx);
 	if (can_complete) {
 		/*
@@ -611,7 +727,8 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 out_retry:
 	ret = VM_FAULT_RETRY;
 out_put_folio:
-	folio_put(folio);
+	if (folio)
+		folio_put(folio);
 out_put_ctx:
 	bpf_fault_ctx_put(ctx);
 out_release_lock:
@@ -1079,7 +1196,6 @@ static bool bpf_fault_is_valid_access(int off, int size,
 				      struct bpf_insn_access_aux *info)
 {
 	const char *fname = prog->aux->attach_func_name;
-	bool is_wp = fname && !strcmp(fname, "handle_wp_fault");
 	bool is_fork = fname && !strcmp(fname, "handle_fork");
 
 	if (off < 0 || off >= sizeof(__u64) * MAX_BPF_FUNC_ARGS)
@@ -1094,16 +1210,23 @@ static bool bpf_fault_is_valid_access(int off, int size,
 		return btf_ctx_access(off, size, type, prog, info);
 
 	/*
-	 * For handle_page_fault and handle_wp_fault: arg1 is the page
-	 * pointer (PTR_TO_MEM, PAGE_SIZE bounds).  For handle_page_fault
-	 * the page is writable; for handle_wp_fault it is read-only
-	 * (may also be NULL if the page table walk failed).
+	 * For handle_page_fault and handle_wp_fault, arg1 is a bpf_dynptr
+	 * over the faulting folio; its length is the folio size (PAGE_SIZE
+	 * for a base page, or a huge-page size).  handle_page_fault may
+	 * write through the dynptr to fill the page.  handle_wp_fault gets
+	 * a dynptr that is marked read-only at runtime (see
+	 * bpf_dynptr_set_rdonly() in handle_bpf_fault_wp()) and may be
+	 * zero-length if the page-table walk failed.
+	 *
+	 * The verifier has no read-only dynptr *view*, so read-only-ness is
+	 * enforced only at runtime (bpf_dynptr_write() -> -EINVAL,
+	 * bpf_dynptr_slice_rdwr() -> NULL).
 	 */
 	if (off == sizeof(__u64)) {
-		info->reg_type = is_wp ?
-			PTR_TO_MEM | PTR_MAYBE_NULL | MEM_RDONLY :
-			PTR_TO_MEM;
-		info->mem_size = PAGE_SIZE;
+		/* The dynptr pointer must be loaded as a full 8-byte value. */
+		if (size != sizeof(__u64))
+			return false;
+		info->reg_type = CONST_PTR_TO_DYNPTR;
 		return true;
 	}
 
@@ -1347,13 +1470,13 @@ static int bpf_fault_validate(void *kdata)
 }
 
 static bpf_fault_ret_t __bpf_fault_handle_page_fault(struct bpf_fault_ops_ctx *ctx,
-					 unsigned char *page)
+					 struct bpf_dynptr *page)
 {
 	return BPF_FAULT_RET_SUCCESS;
 }
 
 static int __bpf_fault_handle_wp_fault(struct bpf_fault_ops_ctx *ctx,
-				       unsigned char *page)
+				       struct bpf_dynptr *page)
 {
 	return 0;
 }

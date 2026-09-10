@@ -59,9 +59,9 @@ registrations can optionally be inherited across `fork()` with the
 ```c
 struct fault_ops {
     int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx,
-                             unsigned char *page);
+                             struct bpf_dynptr *page);
     int (*handle_wp_fault)(struct bpf_fault_ops_ctx *ctx,
-                           unsigned char *page);
+                           struct bpf_dynptr *page);
 };
 ```
 
@@ -72,6 +72,8 @@ struct bpf_fault_ops_ctx {
     unsigned long address;      /* faulting virtual address (page-aligned) */
     unsigned long real_address; /* faulting virtual address (exact) */
     __u32 fault_type;           /* BPF_FAULT_MISSING or BPF_FAULT_WP */
+    __u32 page_order;           /* order of the folio being faulted in;
+                                 * authoritative size is bpf_dynptr_size(page) */
 };
 ```
 
@@ -80,23 +82,27 @@ struct bpf_fault_ops_ctx {
 **handle_page_fault**(ctx, page)
 :   Called on a missing page fault.  `ctx->address` is the page-aligned
     faulting address; `ctx->real_address` is the exact faulting address.
-    `page` points to a PAGE_SIZE buffer of kernel memory, pre-zeroed.
-    For file-backed (shmem) VMAs, the buffer is pre-filled with the
-    current file content at the faulting offset.
+    `page` is a writable `bpf_dynptr` over a pre-zeroed kernel folio;
+    its length is `bpf_dynptr_size(page)` (PAGE_SIZE for a base page, or
+    a huge-page size).  For file-backed (shmem) VMAs the folio is
+    pre-filled with the current file content at the faulting offset.
 
-    The program should fill `page` with the desired content and return 0
-    to install the page.  A non-zero return delivers SIGBUS to the
-    faulting process.
+    The program fills `page` (via `bpf_dynptr_memset()`,
+    `bpf_dynptr_write()`, or `bpf_dynptr_slice_rdwr()`) and returns 0 to
+    install it.  A non-zero return delivers SIGBUS to the faulting
+    process.
 
     The program runs with the VMA lock released and under RCU read-side
     protection.  It must not sleep.
 
 **handle_wp_fault**(ctx, page)
 :   Called on a write-protect fault (write to a page with the uffd-wp
-    PTE bit set).  `page` points to a PAGE_SIZE buffer containing the
-    current contents of the faulting page (read-only view).  Return 0
-    to allow the write (clears the wp bit on the faulting PTE).  A
-    non-zero return delivers SIGBUS.
+    PTE bit set).  `page` is a `bpf_dynptr` over the faulting page's
+    current contents; it is PAGE_SIZE long (WP is PTE-granular), or
+    zero-length if the page-table walk failed.  The dynptr is read-only:
+    writes through it fail at runtime (there is no compile-time check).
+    Return 0 to allow the write (clears the wp bit on the faulting PTE);
+    a non-zero return delivers SIGBUS.
 
     The program runs with the VMA lock released and under RCU read-side
     protection.  It must not sleep.
@@ -115,19 +121,15 @@ char _license[] SEC("license") = "GPL";
 
 SEC("struct_ops/handle_page_fault")
 int BPF_PROG(handle_page_fault, struct bpf_fault_ops_ctx *ctx,
-             unsigned char *buf)
+             struct bpf_dynptr *buf)
 {
-    volatile unsigned long *p = (volatile unsigned long *)buf;
-    unsigned long fill = 0x4141414141414141UL;
-
-    for (int i = 0; i < 4096 / (int)sizeof(unsigned long); i++)
-        p[i] = fill;
+    bpf_dynptr_memset(buf, 0, bpf_dynptr_size(buf), 0x41);
     return 0;
 }
 
 SEC("struct_ops/handle_wp_fault")
 int BPF_PROG(handle_wp_fault, struct bpf_fault_ops_ctx *ctx,
-             unsigned char *buf)
+             struct bpf_dynptr *buf)
 {
     /* Allow all writes; buf contains current page contents */
     return 0;
@@ -646,10 +648,13 @@ CONFIG_64BIT=y
 
 - **64-bit only.**  bpf_fault is not available on 32-bit architectures.
 
-- **Page size assumption in BPF programs.**  The `handle_page_fault`
-  callback receives a `PAGE_SIZE` buffer.  BPF programs that hardcode
-  4096 will break on architectures with different page sizes.  Use
-  the page size from `bpf_fault_ops_ctx` or a runtime constant.
+- **Page size assumption in BPF programs.**  BPF programs that hardcode
+  4096 will break on architectures with different page sizes, and on
+  huge-page faults.  Use `bpf_dynptr_size(page)` as the authoritative
+  length; `ctx->page_order` is informational.  Note `bpf_dynptr_slice()`
+  needs a compile-time-constant length, so for a huge fault either loop
+  over fixed-size chunks or use `bpf_dynptr_write()` / `bpf_dynptr_memset()`
+  which take a runtime length.
 
 - **No userspace page source.**  Unlike `UFFDIO_COPY` which copies from
   a user-provided source buffer, bpf_fault's `handle_page_fault`

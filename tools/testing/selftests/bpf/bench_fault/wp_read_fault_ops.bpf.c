@@ -13,6 +13,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include "bpf_kfuncs.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -26,33 +27,38 @@ volatile __u64 fill_byte;
 
 SEC("struct_ops/handle_page_fault")
 int BPF_PROG(handle_page_fault, struct bpf_fault_ops_ctx *ops_ctx,
-	     unsigned char *buf)
+	     struct bpf_dynptr *buf)
 {
-	unsigned char fb = (unsigned char)fill_byte;
-	volatile unsigned char *p = (volatile unsigned char *)buf;
+	unsigned char fill = (unsigned char)fill_byte;
+	unsigned long size = 4096 << ops_ctx->page_order;
 
-	for (int i = 0; i < 4096; i++)
-		p[i] = fb;
+	bpf_dynptr_memset(buf, 0, size, fill);
 	return 0;
 }
 
 SEC("struct_ops/handle_wp_fault")
 int BPF_PROG(handle_wp_fault, struct bpf_fault_ops_ctx *ops_ctx,
-	     unsigned char *buf)
+	     struct bpf_dynptr *buf)
 {
+	void *p;
 	__u64 sum = 0;
 
 	__sync_fetch_and_add(&wp_fault_count, 1);
 
-	if (!buf)
+	/*
+	 * WP faults are PTE-granular, so the dynptr always spans one page.
+	 * bpf_dynptr_slice()'s length must be a verifier constant.
+	 */
+	p = bpf_dynptr_slice(buf, 0, NULL, 4096);
+	if (!p)
 		return 0;
 
 	/* Record first 8 bytes for quick verification */
-	wp_page_first_u64 = *((volatile __u64 *)buf);
+	wp_page_first_u64 = *((volatile __u64 *)p);
 
 	/* Compute a simple checksum over the whole page */
 	for (int i = 0; i < 4096; i++)
-		sum += ((__u64)((volatile unsigned char *)buf)[i]);
+		sum += ((__u64)((volatile unsigned char *)p)[i]);
 
 	wp_page_checksum = sum;
 

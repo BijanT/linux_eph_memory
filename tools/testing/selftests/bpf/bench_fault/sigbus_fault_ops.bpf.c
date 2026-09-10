@@ -9,6 +9,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include "bpf_kfuncs.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -17,18 +18,18 @@ __u64 wp_fault_count;
 
 SEC("struct_ops/handle_page_fault")
 int BPF_PROG(handle_page_fault, struct bpf_fault_ops_ctx *ops_ctx,
-	     unsigned char *buf)
+	     struct bpf_dynptr *buf)
 {
 	__sync_fetch_and_add(&fault_count, 1);
-	return -1;
+	return BPF_FAULT_RET_SIGBUS;
 }
 
 SEC("struct_ops/handle_wp_fault")
 int BPF_PROG(handle_wp_fault, struct bpf_fault_ops_ctx *ops_ctx,
-	     unsigned char *buf)
+	     struct bpf_dynptr *buf)
 {
 	__sync_fetch_and_add(&wp_fault_count, 1);
-	return -1;
+	return BPF_FAULT_RET_SIGBUS;
 }
 
 SEC(".struct_ops.link")

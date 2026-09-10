@@ -89,7 +89,7 @@ static inline bool bpf_fault_pte_wp(struct vm_area_struct *vma, pte_t pte)
 	return bpf_fault_wp(vma) && pte_uffd_wp(pte);
 }
 
-vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete);
+vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete);
 vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf);
 
 struct fault_ops *bpf_fault_ops_map(struct bpf_fault_ops_link *link);
@@ -451,7 +451,7 @@ static inline bool pte_swp_uffd_wp_any(pte_t pte)
 }
 #else /* CONFIG_USERFAULTFD */
 
-static inline vm_fault_t handle_bpf_fault(struct vm_fault *vmf,
+static inline vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order,
 					  bool can_complete)
 {
 	return VM_FAULT_SIGBUS;

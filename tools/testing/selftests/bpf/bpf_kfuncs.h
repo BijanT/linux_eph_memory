@@ -31,6 +31,9 @@ extern int bpf_dynptr_from_skb_meta(struct __sk_buff *skb, __u64 flags,
 extern void *bpf_dynptr_slice(const struct bpf_dynptr *ptr, __u64 offset,
 			      void *buffer, __u64 buffer__szk) __ksym __weak;
 
+extern int bpf_dynptr_memset(struct bpf_dynptr *ptr, __u64 offset, __u64 size,
+			     __u8 val) __ksym __weak;
+
 /* Description
  *  Obtain a read-write pointer to the dynptr's data
  * Returns

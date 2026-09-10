@@ -740,6 +740,10 @@ struct bpf_fault_ops_ctx {
 	unsigned long address;      /* faulting virtual address - page aligned */
 	unsigned long real_address; /* faulting virtual address - exact */
 	__u32 fault_type;           /* BPF_FAULT_MISSING or BPF_FAULT_WP */
+	__u32 page_order;	    /* order of the folio being faulted in;
+				     * the authoritative size is the dynptr
+				     * length (bpf_dynptr_size(page))
+				     */
 	bool mmap_lock_held;	    /* true if mmap_lock is held */
 	struct mm_struct *mm;       /* mm_struct of the faulting process */
 };
@@ -755,11 +759,13 @@ typedef enum bpf_fault_ret {
 	BPF_FAULT_RET_WAIT = 2,		/* The thread must wait and retry later */
 } bpf_fault_ret_t;
 
+struct bpf_dynptr;
+
 struct fault_ops {
 	bpf_fault_ret_t (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx,
-				 unsigned char *page);
+				 struct bpf_dynptr *page);
 	int (*handle_wp_fault)(struct bpf_fault_ops_ctx *ctx,
-			       unsigned char *page);
+			       struct bpf_dynptr *page);
 	void (*handle_fork)(struct bpf_fault_fork_info *ctx);
 };
 

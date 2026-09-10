@@ -10,6 +10,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include "bpf_kfuncs.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -18,19 +19,18 @@ volatile __u64 wp_fault_count = 0;
 
 SEC("struct_ops/handle_page_fault")
 int BPF_PROG(handle_page_fault, struct bpf_fault_ops_ctx *ops_ctx,
-	     unsigned char *buf)
+	     struct bpf_dynptr *buf)
 {
-	volatile unsigned long *p = (volatile unsigned long *)buf;
-	unsigned long fill = 0x4141414141414141UL;
+	unsigned char fill = 0x41;
+	unsigned long size = 4096 << ops_ctx->page_order;
 
-	for (int i = 0; i < 4096 / (int)sizeof(unsigned long); i++)
-		p[i] = fill;
+	bpf_dynptr_memset(buf, 0, size, fill);
 	return 0;
 }
 
 SEC("struct_ops/handle_wp_fault")
 int BPF_PROG(handle_wp_fault, struct bpf_fault_ops_ctx *ops_ctx,
-	     unsigned char *buf)
+	     struct bpf_dynptr *buf)
 {
 	__sync_fetch_and_add(&wp_fault_count, 1);
 	return 0;

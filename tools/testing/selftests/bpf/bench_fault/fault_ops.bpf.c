@@ -8,6 +8,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include "bpf_kfuncs.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -20,16 +21,15 @@ const volatile __u32 fill_page = 1;
 
 SEC("struct_ops/handle_page_fault")
 int BPF_PROG(handle_page_fault, struct bpf_fault_ops_ctx *ops_ctx,
-	     unsigned char *buf)
+	     struct bpf_dynptr *buf)
 {
-	volatile unsigned long *p = (volatile unsigned long *)buf;
-	unsigned long fill = 0x4141414141414141UL;
+	unsigned char fill = 0x41;
+	unsigned long size = 4096 << ops_ctx->page_order;
 
 	if (!fill_page)
 		return 0;
 
-	for (int i = 0; i < 4096 / (int)sizeof(unsigned long); i++)
-		p[i] = fill;
+	bpf_dynptr_memset(buf, 0, size, fill);
 	return 0;
 }
 
