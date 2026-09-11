@@ -566,7 +566,9 @@ void split_huge_pmd_locked(struct vm_area_struct *vma, unsigned long address,
 bool unmap_huge_pmd_locked(struct vm_area_struct *vma, unsigned long addr,
 			   pmd_t *pmdp, struct folio *folio);
 void map_anon_folio_pmd_nopf(struct folio *folio, pmd_t *pmd,
-		struct vm_area_struct *vma, unsigned long haddr);
+		struct vm_area_struct *vma, unsigned long haddr, bool uffd_wp);
+void map_anon_folio_pmd_pf(struct folio *folio, pmd_t *pmd,
+		struct vm_area_struct *vma, unsigned long haddr, bool uffd_wp);
 
 #else /* CONFIG_TRANSPARENT_HUGEPAGE */
 

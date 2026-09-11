@@ -1374,12 +1374,14 @@ static struct folio *vma_alloc_anon_folio_pmd(struct vm_area_struct *vma,
 }
 
 void map_anon_folio_pmd_nopf(struct folio *folio, pmd_t *pmd,
-		struct vm_area_struct *vma, unsigned long haddr)
+		struct vm_area_struct *vma, unsigned long haddr, bool uffd_wp)
 {
 	pmd_t entry;
 
 	entry = folio_mk_pmd(folio, vma->vm_page_prot);
 	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+	if (uffd_wp)
+		entry = pmd_mkuffd_wp(entry);
 	folio_add_new_anon_rmap(folio, vma, haddr, RMAP_EXCLUSIVE);
 	folio_add_lru_vma(folio, vma);
 	set_pmd_at(vma->vm_mm, haddr, pmd, entry);
@@ -1387,10 +1389,10 @@ void map_anon_folio_pmd_nopf(struct folio *folio, pmd_t *pmd,
 	deferred_split_folio(folio, false);
 }
 
-static void map_anon_folio_pmd_pf(struct folio *folio, pmd_t *pmd,
-		struct vm_area_struct *vma, unsigned long haddr)
+void map_anon_folio_pmd_pf(struct folio *folio, pmd_t *pmd,
+		struct vm_area_struct *vma, unsigned long haddr, bool uffd_wp)
 {
-	map_anon_folio_pmd_nopf(folio, pmd, vma, haddr);
+	map_anon_folio_pmd_nopf(folio, pmd, vma, haddr, uffd_wp);
 	add_mm_counter(vma->vm_mm, MM_ANONPAGES, HPAGE_PMD_NR);
 	count_vm_event(THP_FAULT_ALLOC);
 	count_mthp_stat(HPAGE_PMD_ORDER, MTHP_STAT_ANON_FAULT_ALLOC);
@@ -1404,6 +1406,21 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 	struct folio *folio;
 	pgtable_t pgtable;
 	vm_fault_t ret = 0;
+
+	/*
+	 * Check bpf_fault before allocating a folio that would just be
+	 * discarded, mirroring do_anonymous_page()'s early bpf_fault_missing()
+	 * check.
+	 */
+	if (bpf_fault_missing(vma)) {
+		vmf->ptl = pmd_lock(vma->vm_mm, vmf->pmd);
+		if (pmd_none(*vmf->pmd)) {
+			spin_unlock(vmf->ptl);
+			return handle_bpf_fault(vmf, HPAGE_PMD_ORDER, true);
+		}
+		spin_unlock(vmf->ptl);
+		/* pmd changed under us -- fall through to the normal path */
+	}
 
 	folio = vma_alloc_anon_folio_pmd(vma, vmf->address);
 	if (unlikely(!folio))
@@ -1432,12 +1449,20 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 			VM_BUG_ON(ret & VM_FAULT_FALLBACK);
 			return ret;
 		}
+		/*
+		 * Even though we checked this above, we still should check
+		 * again in case where pmd_none has become true between our
+		 * first check under the ptl lock and now.
+		 */
 		if (bpf_fault_missing(vma)) {
-			ret = VM_FAULT_FALLBACK;
-			goto unlock_release;
+			spin_unlock(vmf->ptl);
+			folio_put(folio);
+			pte_free(vma->vm_mm, pgtable);
+			ret = handle_bpf_fault(vmf, HPAGE_PMD_ORDER, true);
+			return ret;
 		}
 		pgtable_trans_huge_deposit(vma->vm_mm, vmf->pmd, pgtable);
-		map_anon_folio_pmd_pf(folio, vmf->pmd, vma, haddr);
+		map_anon_folio_pmd_pf(folio, vmf->pmd, vma, haddr, false);
 		mm_inc_nr_ptes(vma->vm_mm);
 		spin_unlock(vmf->ptl);
 	}
@@ -1583,7 +1608,7 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 			} else if (bpf_fault_missing(vma)) {
 				spin_unlock(vmf->ptl);
 				pte_free(vma->vm_mm, pgtable);
-				ret = VM_FAULT_FALLBACK;
+				ret = handle_bpf_fault(vmf, HPAGE_PMD_ORDER, true);
 			} else {
 				set_huge_zero_folio(pgtable, vma->vm_mm, vma,
 						   haddr, vmf->pmd, zero_folio);
@@ -2132,7 +2157,7 @@ static vm_fault_t do_huge_zero_wp_pmd(struct vm_fault *vmf)
 	if (ret)
 		goto release;
 	(void)pmdp_huge_clear_flush(vma, haddr, vmf->pmd);
-	map_anon_folio_pmd_pf(folio, vmf->pmd, vma, haddr);
+	map_anon_folio_pmd_pf(folio, vmf->pmd, vma, haddr, false);
 	goto unlock;
 release:
 	folio_put(folio);

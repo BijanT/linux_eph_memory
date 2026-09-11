@@ -6342,11 +6342,14 @@ static inline vm_fault_t wp_huge_pmd(struct vm_fault *vmf)
 	vm_fault_t ret;
 
 	if (vma_is_anonymous(vma)) {
-		if (likely(!unshare) &&
-		    userfaultfd_huge_pmd_wp(vma, vmf->orig_pmd)) {
-			if (userfaultfd_wp_async(vmf->vma))
+		if (likely(!unshare)) {
+			if (bpf_fault_wp(vma) && pmd_uffd_wp(vmf->orig_pmd))
 				goto split;
-			return handle_userfault(vmf, VM_UFFD_WP);
+			if (userfaultfd_huge_pmd_wp(vma, vmf->orig_pmd)) {
+				if (userfaultfd_wp_async(vmf->vma))
+					goto split;
+				return handle_userfault(vmf, VM_UFFD_WP);
+			}
 		}
 		return do_huge_pmd_wp_page(vmf);
 	}

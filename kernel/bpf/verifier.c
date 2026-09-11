@@ -6462,13 +6462,12 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 				}
 			} else if (base_type(info.reg_type) == CONST_PTR_TO_DYNPTR) {
 				/*
-				 * __mark_dynptr_reg() fully initializes the
+				 * mark_dynptr_cb_reg() fully initializes the
 				 * destination register (type, id, dynptr
 				 * state); it must not be a bare type copy.
 				 */
-				__mark_dynptr_reg(&regs[value_regno],
-						  BPF_DYNPTR_TYPE_LOCAL, true,
-						  ++env->id_gen);
+				mark_dynptr_cb_reg(env, &regs[value_regno],
+						    BPF_DYNPTR_TYPE_LOCAL);
 				regs[value_regno].subreg_def = DEF_NOT_SUBREG;
 			} else {
 				mark_reg_known_zero(env, regs,

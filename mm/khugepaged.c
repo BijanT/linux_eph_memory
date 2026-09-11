@@ -1234,7 +1234,7 @@ static enum scan_result collapse_huge_page(struct mm_struct *mm, unsigned long a
 	spin_lock(pmd_ptl);
 	BUG_ON(!pmd_none(*pmd));
 	pgtable_trans_huge_deposit(mm, pmd, pgtable);
-	map_anon_folio_pmd_nopf(folio, pmd, vma, address);
+	map_anon_folio_pmd_nopf(folio, pmd, vma, address, false);
 	spin_unlock(pmd_ptl);
 
 	folio = NULL;

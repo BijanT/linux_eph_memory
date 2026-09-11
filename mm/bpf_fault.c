@@ -17,6 +17,7 @@
 #include <linux/mmap_lock.h>
 #include <linux/mm.h>
 #include <linux/mm_types.h>
+#include <linux/pgalloc.h>
 #include <linux/pagemap.h>
 #include <linux/poll.h>
 #include <linux/rmap.h>
@@ -210,10 +211,54 @@ static int bpf_fault_install_pte(struct vm_fault *vmf, struct folio *folio)
 
 }
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+static int bpf_fault_install_pmd(struct vm_fault *vmf, struct folio *folio)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	vm_flags_t vm_flags = vma->vm_flags;
+	unsigned long address = vmf->address;
+	unsigned long haddr = address & HPAGE_PMD_MASK;
+	spinlock_t *ptl;
+	pgtable_t pgtable;
+	pmd_t *dst_pmd, dst_pmdval;
+	int ret = 0;
+
+	if (!thp_vma_allowable_order(vma, vm_flags, TVA_PAGEFAULT, PMD_ORDER)) {
+		/* Triggers VM_FAULT_FALLBACK */
+		return -EOPNOTSUPP;
+	}
+
+	dst_pmd = bpf_fault_alloc_pmd(mm, address);
+	if (!dst_pmd)
+		return -ENOMEM;
+
+	pgtable = pte_alloc_one(mm);
+	if (unlikely(!pgtable))
+		return -ENOMEM;
+
+	ptl = pmd_lock(mm, dst_pmd);
+	dst_pmdval = pmdp_get(dst_pmd);
+	if (unlikely(!pmd_none(dst_pmdval))) {
+		ret = -EEXIST;
+		pte_free(mm, pgtable);
+		goto out;
+	}
+
+	pgtable_trans_huge_deposit(mm, dst_pmd, pgtable);
+	map_anon_folio_pmd_pf(folio, dst_pmd, vma, haddr, bpf_fault_wp(vma));
+	mm_inc_nr_ptes(mm);
+
+out:
+	spin_unlock(ptl);
+	return ret;
+}
+#else
 static int bpf_fault_install_pmd(struct vm_fault *vmf, struct folio *folio)
 {
 	return -EOPNOTSUPP;
 }
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
 static int bpf_fault_install(struct vm_fault *vmf, struct folio *folio,
 			     int order)
@@ -573,6 +618,19 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 		goto out;
 
 	VM_WARN_ON_ONCE(ctx->mm != mm);
+
+	/*
+	 * struct bpf_dynptr_kern packs the size into the low 24 bits of
+	 * ->size (DYNPTR_MAX_SIZE); a folio at or above that (e.g. a huge
+	 * hstate, or HPAGE_PMD_SIZE on architectures with larger base pages)
+	 * can't be represented as a dynptr.  Fall back to a smaller order
+	 * instead of corrupting the packed type/rdonly bits, and check this
+	 * before allocating a folio that would just be discarded.
+	 */
+	if (bpf_dynptr_check_size((u64)PAGE_SIZE << order)) {
+		ret = VM_FAULT_FALLBACK;
+		goto out;
+	}
 
 	/*
 	 * Check that we can return VM_FAULT_RETRY.
