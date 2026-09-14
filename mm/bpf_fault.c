@@ -89,6 +89,44 @@ static pmd_t *bpf_fault_alloc_pmd(struct mm_struct *mm, unsigned long address)
 }
 
 /*
+ * Look up and lock the pte for address, allocating the pmd (but not the
+ * pte table) if needed.  Returns NULL if no pte exists at this address;
+ * otherwise the caller must pte_unmap_unlock(*ptep, *ptl) when done.
+ */
+static pte_t *bpf_fault_walk_pte(struct mm_struct *mm, unsigned long address,
+				 spinlock_t **ptl)
+{
+	pmd_t *pmd = bpf_fault_alloc_pmd(mm, address);
+
+	if (!pmd)
+		return NULL;
+	return pte_offset_map_lock(mm, pmd, address, ptl);
+}
+
+#ifdef CONFIG_HUGETLB_PAGE
+/*
+ * Look up and lock the huge pte for address under vma.  Returns NULL if no
+ * pte exists.  The caller must already hold hugetlb_vma_lock_read(vma)
+ * (kept held either way) and must spin_unlock(*ptl) when done, if this
+ * returned non-NULL.
+ */
+static pte_t *bpf_fault_walk_hugetlb(struct vm_area_struct *vma,
+				     unsigned long address, spinlock_t **ptl)
+{
+	struct hstate *h = hstate_vma(vma);
+	pte_t *ptep;
+
+	hugetlb_vma_assert_locked(vma);
+
+	ptep = hugetlb_walk(vma, address, huge_page_size(h));
+	if (!ptep)
+		return NULL;
+	*ptl = huge_pte_lock(h, vma->vm_mm, ptep);
+	return ptep;
+}
+#endif /* CONFIG_HUGETLB_PAGE */
+
+/*
  * Lock a VMA for PTE installation.  Mirrors userfaultfd's uffd_lock_vma():
  * try the per-VMA lock first for scalability, falling back to mmap_read_lock
  * when anon_vma needs to be allocated or per-VMA locking fails.
@@ -260,10 +298,121 @@ static int bpf_fault_install_pmd(struct vm_fault *vmf, struct folio *folio)
 }
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
+#ifdef CONFIG_HUGETLB_PAGE
+static void bpf_fault_restore_hugetlb_reserve(struct hstate *h,
+					      struct vm_area_struct *vma,
+					      unsigned long address,
+					      struct folio *folio)
+{
+	restore_reserve_on_error(h, vma, address, folio);
+}
+
+static u32 bpf_fault_compute_hugetlb_hash(struct address_space *mapping, pgoff_t pgoff)
+{
+	return hugetlb_fault_mutex_hash(mapping, pgoff);
+}
+
+static void bpf_fault_drop_hugetlb_mutex(u32 hash)
+{
+	mutex_unlock(&hugetlb_fault_mutex_table[hash]);
+}
+
+static int bpf_fault_install_hugetlb(struct vm_fault *vmf, struct folio *folio)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct hstate *h = hstate_vma(vma);
+	struct mm_struct *mm = vma->vm_mm;
+	vm_flags_t vm_flags = vma->vm_flags;
+	unsigned long address = vmf->address;
+	spinlock_t *ptl = NULL;
+	pte_t *dst_pte, dst_pteval;
+	int ret = 0;
+
+	/*
+	 * The caller (handle_bpf_fault()) already holds
+	 * hugetlb_fault_mutex_table[hash] across the whole
+	 * allocate+callback+install sequence; only the vma lock is acquired
+	 * here, for the install step itself.
+	 */
+	hugetlb_vma_lock_read(vma);
+
+	dst_pte = huge_pte_alloc(mm, vma, address, huge_page_size(h));
+	if (!dst_pte) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* Below is more or less copied from hugetlb_no_page() */
+	ptl = huge_pte_lock(h, mm, dst_pte);
+
+	/* Check if the page table has changed from under us. */
+	if (!pte_same(huge_ptep_get(mm, address, dst_pte), vmf->orig_pte)) {
+		ret = -EEXIST;
+		goto out;
+	}
+
+	hugetlb_add_new_anon_rmap(folio, vma, address);
+
+	/*
+	 * hugetlb_add_new_anon_rmap() just marked this freshly allocated
+	 * folio anon-exclusive, and nothing else can have mapped it yet (the
+	 * pte_same() check above rules out a racing installer), so a write
+	 * fault can be granted write access directly instead of paying for
+	 * a second fault through hugetlb_wp()'s exclusive-owner fast path,
+	 * like hugetlb_no_page() does as a "COW without a second fault"
+	 * optimization. bpf_fault_wp(vma) below still wins if set: it
+	 * wrprotects again regardless of what try_mkwrite produced here.
+	 */
+	dst_pteval = make_huge_pte(vma, folio,
+				   (vm_flags & VM_SHARED) ||
+				   (vmf->flags & FAULT_FLAG_WRITE));
+	if (bpf_fault_wp(vma))
+		dst_pteval = huge_pte_mkuffd_wp(dst_pteval);
+	set_huge_pte_at(mm, address, dst_pte, dst_pteval, huge_page_size(h));
+
+	hugetlb_count_add(pages_per_huge_page(h), mm);
+
+	spin_unlock(ptl);
+	hugetlb_vma_unlock_read(vma);
+
+	folio_set_hugetlb_migratable(folio);
+	return ret;
+out:
+	if (ptl)
+		spin_unlock(ptl);
+	hugetlb_vma_unlock_read(vma);
+	return ret;
+}
+#else
+static void bpf_fault_restore_hugetlb_reserve(struct hstate *h,
+					     struct vm_area_struct *vma,
+					     unsigned long address,
+					     struct folio *folio)
+{
+}
+
+static u32 bpf_fault_compute_hugetlb_hash(struct address_space *mapping, pgoff_t pgoff)
+{
+	return 0;
+}
+
+static void bpf_fault_drop_hugetlb_mutex(u32 hash)
+{
+}
+
+static int bpf_fault_install_hugetlb(struct vm_fault *vmf, struct folio *folio)
+{
+	return -EOPNOTSUPP;
+}
+#endif /* CONFIG_HUGETLB_PAGE */
+
 static int bpf_fault_install(struct vm_fault *vmf, struct folio *folio,
 			     int order)
 {
-	if (order == 0)
+	struct vm_area_struct *vma = vmf->vma;
+	if (is_vm_hugetlb_page(vma))
+		return bpf_fault_install_hugetlb(vmf, folio);
+	else if (order == 0)
 		return bpf_fault_install_pte(vmf, folio);
 	else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && order == HPAGE_PMD_ORDER)
 		return bpf_fault_install_pmd(vmf, folio);
@@ -366,32 +515,44 @@ static struct folio *bpf_fault_wp_get_folio(struct vm_fault *vmf,
 		return ERR_CAST(vma);
 
 	if (bpf_fault_wp(vma)) {
-		pmd_t *pmd;
-		pte_t *ptep, pte;
-		spinlock_t *ptl;
-		struct page *page;
+		if (is_vm_hugetlb_page(vma)) {
+#ifdef CONFIG_HUGETLB_PAGE
+			pte_t *ptep, pte;
+			spinlock_t *ptl;
 
-		pmd = bpf_fault_alloc_pmd(mm, address);
-		if (!pmd)
-			goto out;
+			hugetlb_vma_lock_read(vma);
+			ptep = bpf_fault_walk_hugetlb(vma, address, &ptl);
+			if (ptep) {
+				pte = huge_ptep_get(mm, address, ptep);
+				if (pte_present(pte)) {
+					folio = page_folio(pte_page(pte));
+					folio_get(folio);
+				}
+				spin_unlock(ptl);
+			}
+			hugetlb_vma_unlock_read(vma);
+#endif /* CONFIG_HUGETLB_PAGE */
+		} else {
+			pte_t *ptep, pte;
+			spinlock_t *ptl;
+			struct page *page;
 
-		ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
-		if (!ptep)
-			goto out;
-
-		pte = ptep_get(ptep);
-		if (pte_present(pte)) {
-			page = vm_normal_page(vma, address, pte);
-			if (page) {
-				folio = page_folio(page);
-				*folio_off = folio_page_idx(folio, page) *
-					     PAGE_SIZE;
-				folio_get(folio);
+			ptep = bpf_fault_walk_pte(mm, address, &ptl);
+			if (ptep) {
+				pte = ptep_get(ptep);
+				if (pte_present(pte)) {
+					page = vm_normal_page(vma, address, pte);
+					if (page) {
+						folio = page_folio(page);
+						*folio_off = folio_page_idx(folio, page) *
+							     PAGE_SIZE;
+						folio_get(folio);
+					}
+				}
+				pte_unmap_unlock(ptep, ptl);
 			}
 		}
-		pte_unmap_unlock(ptep, ptl);
 	}
-out:
 	bpf_fault_unlock_vma(vma);
 	return folio;
 }
@@ -411,12 +572,18 @@ static int bpf_fault_call_handle_wp(struct vm_fault *vmf,
 				    struct mm_struct *mm,
 				    struct folio *folio, size_t folio_off)
 {
+	bool is_hugetlb = folio && folio_test_hugetlb(folio);
+	int order = is_hugetlb ? folio_order(folio) : 0;
 	struct bpf_fault_ops_ctx ops_ctx = {
 		.address = vmf->address,
 		.real_address = vmf->real_address,
 		.fault_type = BPF_FAULT_WP,
-		/* WP faults are PTE-granular; the dynptr spans one page. */
-		.page_order = 0,
+		/*
+		 * WP faults are PTE-granular except hugetlb, which has no
+		 * split-and-retry escape hatch and must be resolved at full
+		 * hstate granularity.
+		 */
+		.page_order = order,
 		.mmap_lock_held = false,
 		.mm = mm,
 	};
@@ -424,7 +591,16 @@ static int bpf_fault_call_handle_wp(struct vm_fault *vmf,
 	struct fault_ops *ops;
 	int ret;
 
-	if (folio)
+	if (bpf_dynptr_check_size((u64)PAGE_SIZE << order)) {
+		WARN_ONCE(is_hugetlb, "bpf_fault_wp: hugetlb folio size %zu exceeds BPF_DYNPTR_MAX_SIZE. Should have been rejected at registration.\n",
+			  (size_t)PAGE_SIZE << order);
+		return BPF_FAULT_RET_SIGBUS;
+	}
+
+	if (is_hugetlb)
+		bpf_dynptr_init(&dp, folio_address(folio) + folio_off,
+				BPF_DYNPTR_TYPE_LOCAL, 0, folio_size(folio));
+	else if (folio)
 		bpf_dynptr_init(&dp, folio_address(folio) + folio_off,
 				BPF_DYNPTR_TYPE_LOCAL, 0, PAGE_SIZE);
 	else
@@ -443,17 +619,16 @@ static int bpf_fault_call_handle_wp(struct vm_fault *vmf,
 }
 
 /*
- * Resolve a PTE-level uffd-wp marker after the BPF program allowed the
- * write: re-acquire the VMA lock, re-walk the page tables, and clear the
- * uffd-wp bit so the retried fault finds the PTE writable.
+ * Resolve a uffd-wp marker after the BPF program allowed the write:
+ * re-acquire the VMA lock and clear the uffd-wp bit over the faulting page
+ * (the whole hstate for hugetlb) so the retried fault finds it writable.
  */
-static int bpf_fault_wp_resolve_pte(struct vm_fault *vmf, struct mm_struct *mm)
+static int bpf_fault_wp_resolve(struct vm_fault *vmf, struct mm_struct *mm)
 {
 	unsigned long address = vmf->address;
 	struct vm_area_struct *vma;
-	pmd_t *pmd;
-	pte_t *ptep, pte;
-	spinlock_t *ptl;
+	struct mmu_gather tlb;
+	unsigned long len, mm_cp_flags = MM_CP_UFFD_WP_RESOLVE;
 
 	vma = bpf_fault_lock_vma(mm, address);
 	if (IS_ERR(vma))
@@ -462,34 +637,23 @@ static int bpf_fault_wp_resolve_pte(struct vm_fault *vmf, struct mm_struct *mm)
 	if (!bpf_fault_wp(vma))
 		goto out;
 
-	pmd = bpf_fault_alloc_pmd(mm, address);
-	if (!pmd)
-		goto out;
+	if (vma_wants_manual_pte_write_upgrade(vma))
+		mm_cp_flags |= MM_CP_TRY_CHANGE_WRITABLE;
 
-	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
-	if (!ptep)
-		goto out;
+	/*
+	 * PMD-mapped THP WP faults go through do_huge_pmd_wp_page(), which
+	 * has no bpf_fault hook, so nothing PMD-level reaches here yet; a
+	 * PMD-granularity range is added along with that hook in a later
+	 * change.
+	 */
+	len = is_vm_hugetlb_page(vma) ? huge_page_size(hstate_vma(vma)) : PAGE_SIZE;
 
-	pte = ptep_get(ptep);
-	if (pte_present(pte) && pte_uffd_wp(pte)) {
-		pte = pte_clear_uffd_wp(pte);
-		set_pte_at(mm, address, ptep, pte);
-	}
-	pte_unmap_unlock(ptep, ptl);
+	tlb_gather_mmu(&tlb, mm);
+	change_protection(&tlb, vma, address, address + len, mm_cp_flags);
+	tlb_finish_mmu(&tlb);
 out:
 	bpf_fault_unlock_vma(vma);
 	return 0;
-}
-
-static int bpf_fault_wp_resolve(struct vm_fault *vmf, struct mm_struct *mm)
-{
-	/*
-	 * Only PTE-level uffd-wp markers exist today.  PMD-mapped THP WP
-	 * faults go through do_huge_pmd_wp_page(), which has no bpf_fault
-	 * hook, so nothing PMD-level reaches here yet; a bpf_fault_wp_resolve_pmd()
-	 * split is added along with that hook in a later change.
-	 */
-	return bpf_fault_wp_resolve_pte(vmf, mm);
 }
 
 /*
@@ -585,13 +749,28 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	struct address_space *mapping = NULL;
+	struct hstate *h = NULL;
 	struct folio *folio = NULL;
 	unsigned long address = vmf->address;
+	bool is_hugetlb = is_vm_hugetlb_page(vma);
 	void *kaddr;
 	int generation;
 	int err;
 	bool inherited_ctx;
 	bool fault_lock_held = true;
+	bool folio_locked = false;
+	/*
+	 * For the hugetlb case, the caller (hugetlb_no_page()) hands off
+	 * hugetlb_fault_mutex_table[hash] already held, and keeps it held
+	 * across this whole allocate+callback+install sequence so hugetlb
+	 * reservation accounting stays serialized against concurrent faults
+	 * on the same page, matching hugetlb_no_page()'s own locking
+	 * discipline for the non-bpf_fault case. We are responsible for
+	 * releasing it, either before waiting or on any return path below.
+	 */
+	bool hugetlb_mutex_held = is_hugetlb;
+	u32 hash = is_hugetlb ?
+		bpf_fault_compute_hugetlb_hash(vma->vm_file->f_mapping, vmf->pgoff) : 0;
 
 	/*
 	 * We don't do userfault handling for the final child pid update
@@ -628,6 +807,8 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 	 * before allocating a folio that would just be discarded.
 	 */
 	if (bpf_dynptr_check_size((u64)PAGE_SIZE << order)) {
+		WARN_ONCE(is_hugetlb, "bpf_fault: hugetlb folio size %zu exceeds BPF_DYNPTR_MAX_SIZE. Should have been rejected at registration.\n",
+			  (size_t)PAGE_SIZE << order);
 		ret = VM_FAULT_FALLBACK;
 		goto out;
 	}
@@ -661,11 +842,24 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 	/*
 	 * Allocate a zeroed folio for the BPF program to populate.
 	 */
-	folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE | __GFP_ZERO, order, vma,
-				address);
-	if (!folio) {
-		ret = (order == 0) ? VM_FAULT_RETRY : VM_FAULT_FALLBACK;
-		goto out_put_ctx;
+	if (is_hugetlb) {
+		folio = alloc_hugetlb_folio(vma, address, false);
+		if (IS_ERR(folio)) {
+			ret = vmf_error(PTR_ERR(folio));
+			goto out_put_ctx;
+		}
+		folio_zero_user(folio, vmf->real_address);
+		__folio_mark_uptodate(folio);
+		folio_lock(folio);
+		h = hstate_vma(vma);
+		folio_locked = true;
+	} else {
+		folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE | __GFP_ZERO,
+					order, vma, address);
+		if (!folio) {
+			ret = (order == 0) ? VM_FAULT_RETRY : VM_FAULT_FALLBACK;
+			goto out_put_ctx;
+		}
 	}
 
 	/*
@@ -679,7 +873,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 	 * For shmem/file-backed VMAs, pre-populate the page with existing
 	 * page cache contents so the BPF program sees the actual data.
 	 */
-	if (vma->vm_ops && vma->vm_file) {
+	if (vma->vm_ops && vma->vm_file && !is_hugetlb) {
 		struct folio *src;
 		mapping = vma->vm_file->f_mapping;
 
@@ -714,6 +908,11 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 	inherited_ctx = READ_ONCE(ctx->inherited);
 	if (err == BPF_FAULT_RET_WAIT && !inherited_ctx) {
 		ret = VM_FAULT_RETRY;
+		if (folio_locked)
+			folio_unlock(folio);
+		if (is_hugetlb)
+			bpf_fault_restore_hugetlb_reserve(h, vma, address,
+							  folio);
 		/* Free the folio before waiting */
 		folio_put(folio);
 		folio = NULL;
@@ -726,6 +925,13 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 		if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
 			goto out_put_ctx;
 
+		/*
+		 * Don't sleep while holding any locks.
+		 */
+		if (hugetlb_mutex_held) {
+			bpf_fault_drop_hugetlb_mutex(hash);
+			hugetlb_mutex_held = false;
+		}
 		bpf_fault_wait(vmf, ctx, generation, &fault_lock_held);
 		goto out_put_ctx;
 	} else if (err != BPF_FAULT_RET_SUCCESS) {
@@ -749,7 +955,12 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 
 	if (anon_vma_prepare(vma))
 		goto out_retry;
-	if (mem_cgroup_charge(folio, mm, GFP_KERNEL))
+	/*
+	 * Charge this allocation to the cgroup if it's not a hugetlb folio.
+	 * HugeTLB cgroup accounting done in alloc_hugetlb_folio(). No need to
+	 * do it again here.
+	 */
+	if (!is_hugetlb && mem_cgroup_charge(folio, mm, GFP_KERNEL))
 		goto out_retry;
 
 	err = bpf_fault_install(vmf, folio, order);
@@ -760,6 +971,8 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 		goto out_retry;
 	}
 
+	if (folio_locked)
+		folio_unlock(folio);
 	folio = NULL;
 	bpf_fault_ctx_put(ctx);
 	if (can_complete) {
@@ -776,6 +989,8 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 		 * COMPLETED and would try to process a folio that
 		 * doesn't exist.
 		 */
+		if (hugetlb_mutex_held)
+			bpf_fault_drop_hugetlb_mutex(hash);
 		return 0;
 	} else {
 		ret = VM_FAULT_RETRY;
@@ -785,8 +1000,14 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, int order, bool can_complete)
 out_retry:
 	ret = VM_FAULT_RETRY;
 out_put_folio:
-	if (folio)
+	if (folio) {
+		if (folio_locked)
+			folio_unlock(folio);
+		if (is_hugetlb)
+			bpf_fault_restore_hugetlb_reserve(h, vma, address,
+							  folio);
 		folio_put(folio);
+	}
 out_put_ctx:
 	bpf_fault_ctx_put(ctx);
 out_release_lock:
@@ -799,6 +1020,8 @@ out_release_lock:
 	    ret == VM_FAULT_RETRY)
 		release_fault_lock(vmf);
 out:
+	if (hugetlb_mutex_held)
+		bpf_fault_drop_hugetlb_mutex(hash);
 	return ret;
 }
 
@@ -1026,8 +1249,12 @@ static int __bpf_fault_register_range(struct bpf_fault_ctx *ctx,
 		if (!vma_can_bpf_fault(cur))
 			goto out_unlock;
 
-		/* Shared file-backed VMAs not yet supported (needs file rmap). */
-		if (!vma_is_anonymous(cur) && (cur->vm_flags & VM_SHARED))
+		/*
+		 * Shared file-backed VMAs not yet supported (needs file rmap).
+		 * Reject VM_MAYSHARE vmas for now to make HugeTLB support easier.
+		 */
+		if (!vma_is_anonymous(cur) &&
+		    ((cur->vm_flags & VM_SHARED) || (cur->vm_flags & VM_MAYSHARE)))
 			goto out_unlock;
 
 		/*
@@ -1042,13 +1269,18 @@ static int __bpf_fault_register_range(struct bpf_fault_ctx *ctx,
 		/*
 		 * If this vma contains ending address and huge pages,
 		 * check alignment.
+		 * Also, HugeTLB pages can easily be 1GB in size, but dynptrs are
+		 * limited to DYNPTR_MAX_SIZE (24 bits). If the range contains HugeTLB
+		 * pages of over that size, reject the registration.
 		 */
-		if (is_vm_hugetlb_page(cur) && end <= cur->vm_end &&
-		    end > cur->vm_start) {
+		if (is_vm_hugetlb_page(cur)) {
 			unsigned long vma_hpagesize = vma_kernel_pagesize(cur);
 
 			ret = -EINVAL;
-			if (end & (vma_hpagesize - 1))
+			if (bpf_dynptr_check_size(vma_hpagesize))
+				goto out_unlock;
+			if (end <= cur->vm_end && end > cur->vm_start &&
+			    (end & (vma_hpagesize - 1)))
 				goto out_unlock;
 		}
 
@@ -1596,7 +1828,6 @@ int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
 		tlb_gather_mmu(&tlb, mm);
 		err = change_protection(&tlb, dst_vma, _start, _end, mm_cp_flags);
 		tlb_finish_mmu(&tlb);
-
 		if (err < 0)
 			break;
 		err = 0;

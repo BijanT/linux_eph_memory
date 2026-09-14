@@ -98,7 +98,7 @@ struct bpf_fault_ops_ctx {
 **handle_wp_fault**(ctx, page)
 :   Called on a write-protect fault (write to a page with the uffd-wp
     PTE bit set).  `page` is a `bpf_dynptr` over the faulting page's
-    current contents; it is PAGE_SIZE long (WP is PTE-granular), or
+    current contents; it is `bpf_dynptr_size(page)` bytes long, or
     zero-length if the page-table walk failed.  The dynptr is read-only:
     writes through it fail at runtime (there is no compile-time check).
     Return 0 to allow the write (clears the wp bit on the faulting PTE);
@@ -373,7 +373,7 @@ bpf_fault supports the following VMA types:
 | Mapping type | Missing mode | WP mode | Notes |
 |-------------|:---:|:---:|-------|
 | Anonymous private (`MAP_PRIVATE \| MAP_ANONYMOUS`) | Yes | Yes | Primary use case |
-| Hugetlb (private and shared) | Yes | Yes | Requires huge-page-aligned boundaries |
+| Hugetlb (private) | Yes | Yes | Requires huge-page-aligned boundaries |
 | Shmem/tmpfs (private) | Yes | Yes | Pre-fills page from file content |
 | Shmem/tmpfs (shared, `MAP_SHARED`) | No | No | Needs file rmap support |
 | File-backed (ext4, xfs, etc.) | No | No | Not supported |

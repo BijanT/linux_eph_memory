@@ -4800,7 +4800,7 @@ const struct vm_operations_struct hugetlb_vm_ops = {
 #endif
 };
 
-static pte_t make_huge_pte(struct vm_area_struct *vma, struct folio *folio,
+pte_t make_huge_pte(struct vm_area_struct *vma, struct folio *folio,
 		bool try_mkwrite)
 {
 	pte_t entry = folio_mk_pte(folio, vma->vm_page_prot);
@@ -5749,6 +5749,33 @@ static vm_fault_t hugetlb_no_page(struct address_space *mapping,
 
 			return hugetlb_handle_userfault(vmf, mapping,
 							VM_UFFD_MISSING);
+		} else if (bpf_fault_missing(vma)) {
+			if (!hugetlb_pte_stable(h, mm, vmf->address, vmf->pte, vmf->orig_pte)) {
+				ret = 0;
+				goto out;
+			}
+
+			/*
+			 * Keep hugetlb_fault_mutex_table[hash] held across the
+			 * whole allocate+callback+install sequence inside
+			 * handle_bpf_fault(), so reservation accounting
+			 * (alloc_hugetlb_folio()/restore_reserve_on_error())
+			 * stays serialized against concurrent faults on this
+			 * page, matching this function's own locking discipline
+			 * above. handle_bpf_fault() releases it before waiting
+			 * or on return.
+			 *
+			 * hugetlb_vma_lock_read() is dropped now instead: a
+			 * handle_page_fault program can call
+			 * bpf_fault_writeprotect() -> hugetlb_change_protection(),
+			 * which takes hugetlb_vma_lock_write() on this same vma
+			 * and would self-deadlock against a read lock held
+			 * across the callback. bpf_fault_install_hugetlb()
+			 * re-acquires it for the install step once the callback
+			 * has returned.
+			 */
+			hugetlb_vma_unlock_read(vma);
+			return handle_bpf_fault(vmf, h->order, true);
 		}
 
 		if (!(vma->vm_flags & VM_MAYSHARE)) {
@@ -6070,6 +6097,12 @@ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 		set_huge_pte_at(mm, vmf.address, vmf.pte, vmf.orig_pte,
 				huge_page_size(hstate_vma(vma)));
 		/* Fallthrough to CoW */
+	} else if (bpf_fault_wp(vma) && huge_pte_uffd_wp(huge_ptep_get(mm, vmf.address, vmf.pte)) &&
+		   (flags & FAULT_FLAG_WRITE) && !huge_pte_write(vmf.orig_pte)) {
+		spin_unlock(vmf.ptl);
+		hugetlb_vma_unlock_read(vma);
+		mutex_unlock(&hugetlb_fault_mutex_table[hash]);
+		return handle_bpf_fault_wp(&vmf);
 	}
 
 	if (flags & (FAULT_FLAG_WRITE|FAULT_FLAG_UNSHARE)) {

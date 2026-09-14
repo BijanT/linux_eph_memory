@@ -147,6 +147,8 @@ int hugetlb_mfill_atomic_pte(pte_t *dst_pte,
 			     uffd_flags_t flags,
 			     struct folio **foliop);
 #endif /* CONFIG_USERFAULTFD */
+pte_t make_huge_pte(struct vm_area_struct *vma, struct folio *folio,
+		bool try_mkwrite);
 long hugetlb_reserve_pages(struct inode *inode, long from, long to,
 			   struct vm_area_struct *vma, vma_flags_t vma_flags);
 long hugetlb_unreserve_pages(struct inode *inode, long start, long end,
