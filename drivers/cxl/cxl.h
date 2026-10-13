@@ -333,6 +333,7 @@ struct cxl_dc_tag_group;
  *	     and the host assigns @seq_num in event arrival order at
  *	     cxl_add_pending() time.  Used by the dax layer to assemble
  *	     ranges in the right order regardless of source.
+ * @force_released: Set when the device has forcefully released the extent.
  */
 struct dc_extent {
 	struct device dev;
@@ -342,6 +343,7 @@ struct dc_extent {
 	struct range hpa_range;
 	uuid_t uuid;
 	u16 seq_num;
+	bool force_released;
 };
 
 /**

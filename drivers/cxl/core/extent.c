@@ -137,7 +137,8 @@ static void dc_extent_release(struct device *dev)
 	struct dc_extent *dc_extent = to_dc_extent(dev);
 	struct cxl_dc_tag_group *group = dc_extent->group;
 
-	cxled_release_extent(dc_extent->cxled, dc_extent);
+	if (!dc_extent->force_released)
+		cxled_release_extent(dc_extent->cxled, dc_extent);
 	xa_erase(&group->cxlr_dax->dc_extents, dc_extent->dev.id);
 	xa_erase(&group->dc_extents, dc_extent->seq_num);
 	group->nr_extents--;
@@ -355,6 +356,8 @@ dc_extent_build(struct cxl_endpoint_decoder *cxled,
 				   range_len(ext_range) - 1;
 	dc_extent->seq_num = seq_num;
 	import_uuid(&dc_extent->uuid, extent->uuid);
+	dc_extent->force_released = false;
+
 	return dc_extent;
 }
 
@@ -520,7 +523,7 @@ void rm_tag_group(struct cxl_dc_tag_group *group)
 		free_tag_group(group);
 }
 
-int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
+int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent, bool forced)
 {
 	u64 start_dpa = le64_to_cpu(extent->start_dpa);
 	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
@@ -530,6 +533,7 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 	struct dc_extent *dc_extent;
 	struct cxl_region *cxlr;
 	struct range dpa_range;
+	enum dc_event event;
 	unsigned long idx;
 	uuid_t tag;
 	int rc;
@@ -589,7 +593,8 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 		return -EINVAL;
 	}
 
-	rc = cxlr_notify_extent(cxlr, DCD_RELEASE_CAPACITY, group);
+	event = forced ? DCD_FORCED_CAPACITY_RELEASE : DCD_RELEASE_CAPACITY;
+	rc = cxlr_notify_extent(cxlr, event, group);
 	if (rc) {
 		/*
 		 * dax layer refused (-EBUSY) or failed (-ENOMEM, etc.).  Do

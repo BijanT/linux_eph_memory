@@ -64,7 +64,7 @@ static int cxl_dax_group_add(struct dax_region *dax_region,
 }
 
 static int cxl_dax_group_rm(struct dax_region *dax_region,
-			    struct cxl_dc_tag_group *group)
+			    struct cxl_dc_tag_group *group, bool forced)
 {
 	struct dc_extent *dc_extent;
 	struct device **devs;
@@ -82,10 +82,14 @@ static int cxl_dax_group_rm(struct dax_region *dax_region,
 	xa_for_each(&group->dc_extents, index, dc_extent) {
 		if (n == group->nr_extents)
 			break;
+		dc_extent->force_released = forced;
 		devs[n++] = &dc_extent->dev;
 	}
 
-	rc = dax_region_rm_resources(dax_region, devs, n);
+	if (forced)
+		rc = dax_region_force_rm_resources(dax_region, devs, n);
+	else
+		rc = dax_region_rm_resources(dax_region, devs, n);
 	kfree(devs);
 	return rc;
 }
@@ -101,8 +105,9 @@ static int cxl_dax_region_notify(struct device *dev,
 	case DCD_ADD_CAPACITY:
 		return cxl_dax_group_add(dax_region, group);
 	case DCD_RELEASE_CAPACITY:
-		return cxl_dax_group_rm(dax_region, group);
+		return cxl_dax_group_rm(dax_region, group, false);
 	case DCD_FORCED_CAPACITY_RELEASE:
+		return cxl_dax_group_rm(dax_region, group, true);
 	default:
 		dev_err(&cxlr_dax->dev, "Unknown DC event %d\n",
 			notify_data->event);

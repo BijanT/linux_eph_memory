@@ -71,7 +71,7 @@ int devm_cxl_add_pmem_region(struct cxl_region *cxlr);
 int cxl_add_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent,
 		   u16 seq_num);
 bool cxl_tag_already_committed(const uuid_t *tag);
-int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent);
+int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent, bool forced);
 int online_tag_group(struct cxl_dc_tag_group *group);
 void rm_tag_group(struct cxl_dc_tag_group *group);
 int cxlr_notify_extent(struct cxl_region *cxlr, enum dc_event event,

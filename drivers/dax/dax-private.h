@@ -69,12 +69,15 @@ struct dax_mapping {
  * @range: resource-span
  * @mapping: reference to the dax_mapping for this range
  * @dax_resource: if not NULL; dax DC resource containing this range
+ * @revoked: the memory was force removed; the range is dead and must not be
+ *	     mapped or have its resources released again
  */
 struct dev_dax_range {
 	unsigned long pgoff;
 	struct range range;
 	struct dax_mapping *mapping;
 	struct dax_resource *dax_resource;
+	bool revoked;
 };
 
 /**
@@ -157,6 +160,8 @@ int dax_region_add_resource(struct dax_region *dax_region, struct device *dev,
 int dax_region_rm_resource(struct dax_region *dax_region,
 			   struct device *dev);
 int dax_region_rm_resources(struct dax_region *dax_region,
+			    struct device * const *devs, unsigned int n);
+int dax_region_force_rm_resources(struct dax_region *dax_region,
 			    struct device * const *devs, unsigned int n);
 
 static inline struct dev_dax *to_dev_dax(struct device *dev)
