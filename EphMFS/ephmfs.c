@@ -1151,13 +1151,6 @@ static int ephmfs_kill_procs(struct inode *inode, loff_t index, loff_t count, sh
 	if (!owner)
 		goto unlock;
 
-	if ((mf_flags & MF_ACTION_REQUIRED) && same_thread_group(owner, current))
-		ret = force_sig_mceerr(BUS_MCEERR_AR, (void __user *)addr, lsb);
-	else
-		ret = send_sig_mceerr(BUS_MCEERR_AO, (void __user *)addr, lsb, owner);
-
-	if (ret)
-		pr_err("EphMFS: Failed to kill processes for memory failure (err=%d)\n", ret);
 unlock:
 	dax_unlock_mapping_entry(inode->i_mapping, index, cookie);
 
