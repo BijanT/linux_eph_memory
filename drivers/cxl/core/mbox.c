@@ -1661,11 +1661,10 @@ static void cxl_handle_dcd_event_records(struct cxl_memdev_state *mds,
 		rc = handle_add_event(mds, event);
 		break;
 	case DCD_RELEASE_CAPACITY:
-		rc = cxl_rm_extent(mds, &event->extent);
+		rc = cxl_rm_extent(mds, &event->extent, false);
 		break;
 	case DCD_FORCED_CAPACITY_RELEASE:
-		dev_err_ratelimited(dev, "Forced release event ignored.\n");
-		rc = 0;
+		rc = cxl_rm_extent(mds, &event->extent, true);
 		break;
 	default:
 		rc = -EINVAL;

@@ -64,29 +64,38 @@ static int cxl_dax_group_add(struct dax_region *dax_region,
 }
 
 static int cxl_dax_group_rm(struct dax_region *dax_region,
-			    struct cxl_dc_tag_group *group)
+			    struct cxl_dc_tag_group *group, bool forced)
 {
 	struct dc_extent *dc_extent;
 	struct device **devs;
 	unsigned long index;
 	unsigned int n = 0;
-	int rc;
+	int rc = 0;
 
 	if (!group->nr_extents)
 		return 0;
 
-	devs = kmalloc_array(group->nr_extents, sizeof(*devs), GFP_KERNEL);
-	if (!devs)
-		return -ENOMEM;
+	if (forced) {
+		xa_for_each(&group->dc_extents, index, dc_extent) {
+			if (n == group->nr_extents)
+				break;
+			dax_region_force_rm_resource(dax_region, &dc_extent->dev);
+			n++;
+		}
+	} else {
+		devs = kmalloc_array(group->nr_extents, sizeof(*devs), GFP_KERNEL);
+		if (!devs)
+			return -ENOMEM;
 
-	xa_for_each(&group->dc_extents, index, dc_extent) {
-		if (n == group->nr_extents)
-			break;
-		devs[n++] = &dc_extent->dev;
+		xa_for_each(&group->dc_extents, index, dc_extent) {
+			if (n == group->nr_extents)
+				break;
+			devs[n++] = &dc_extent->dev;
+		}
+		rc = dax_region_rm_resources(dax_region, devs, n);
+		kfree(devs);
 	}
 
-	rc = dax_region_rm_resources(dax_region, devs, n);
-	kfree(devs);
 	return rc;
 }
 
@@ -101,8 +110,9 @@ static int cxl_dax_region_notify(struct device *dev,
 	case DCD_ADD_CAPACITY:
 		return cxl_dax_group_add(dax_region, group);
 	case DCD_RELEASE_CAPACITY:
-		return cxl_dax_group_rm(dax_region, group);
+		return cxl_dax_group_rm(dax_region, group, false);
 	case DCD_FORCED_CAPACITY_RELEASE:
+		return cxl_dax_group_rm(dax_region, group, true);
 	default:
 		dev_err(&cxlr_dax->dev, "Unknown DC event %d\n",
 			notify_data->event);

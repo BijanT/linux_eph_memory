@@ -7,6 +7,7 @@
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/dax.h>
+#include <linux/mm.h>
 #include <linux/io.h>
 #include "dax-private.h"
 #include "bus.h"
@@ -273,6 +274,127 @@ int dax_region_rm_resource(struct dax_region *dax_region,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(dax_region_rm_resource);
+
+static bool is_dev_dax(struct device *dev);
+
+struct find_dev_dax_ctx {
+	struct dax_resource *dax_resource;
+	struct dev_dax *out_dev_dax;
+	int out_range_index;
+};
+
+static int dev_dax_range_index(struct dev_dax *dev_dax,
+			       const struct dax_resource *dax_resource)
+{
+	lockdep_assert_held(&dax_region_rwsem);
+
+	for (int i = 0; i < dev_dax->nr_range; i++) {
+		if (dev_dax->ranges[i].dax_resource == dax_resource)
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * Should be called with the dax_region_rwsem held for read.  On a match the
+ * caller owns a reference to ctx->out_dev_dax and must put_device() it.
+ */
+static int dax_find_dev_dax_by_resource(struct device *dev, void *data)
+{
+	struct find_dev_dax_ctx *ctx = data;
+	struct dev_dax *dev_dax;
+	int idx;
+
+	if (!is_dev_dax(dev))
+		return 0;
+
+	dev_dax = to_dev_dax(dev);
+	idx = dev_dax_range_index(dev_dax, ctx->dax_resource);
+	if (idx < 0)
+		return 0;
+
+	get_device(dev);
+	ctx->out_range_index = idx;
+	ctx->out_dev_dax = dev_dax;
+	return 1;
+}
+
+/*
+ * Stop all users of the range of @dev_dax at @off/@len (bytes into the dax
+ * device) because the memory behind it is going away.
+ */
+static void dax_revoke_range(struct dev_dax *dev_dax, u64 off, u64 len)
+{
+	struct dax_device *dax_dev = dev_dax->dax_dev;
+	int rc;
+
+	/*
+	 * MF_MEM_PRE_REMOVE: the holder (e.g. ephmfs) revokes and unmaps the
+	 * pages and signals the owner, but does not poison the pages.
+	 */
+	rc = dax_holder_notify_failure(dax_dev, off, len, MF_MEM_PRE_REMOVE);
+	if (!rc)
+		return;
+
+	if (rc != -EOPNOTSUPP)
+		dev_warn(&dev_dax->dev,
+			 "revoke notify of %#llx+%#llx failed: %d\n",
+			 off, len, rc);
+
+	/* No (working) holder; at least make sure nothing stays mapped. */
+	unmap_mapping_range(dax_inode(dax_dev)->i_mapping, off, len, 1);
+}
+
+/*
+ * Remove one extent whose capacity the device has already taken back.  Unlike
+ * dax_region_rm_resource() this cannot refuse because the resource is in use;
+ * any dev_dax using it is revoked first.
+ */
+void dax_region_force_rm_resource(struct dax_region *dax_region,
+				  struct device *dev)
+{
+	struct find_dev_dax_ctx ctx = {};
+	struct dev_dax_range *dax_range;
+	struct dax_resource *r;
+	u64 off = 0, len = 0;
+	int idx;
+
+	/* Find the user, if any, and where its range sits in the dax device */
+	down_write(&dax_region_rwsem);
+	r = dev_get_drvdata(dev);
+	if (r) {
+		ctx.dax_resource = r;
+		ctx.out_dev_dax = NULL;
+		device_for_each_child(dax_region->dev, &ctx,
+				      dax_find_dev_dax_by_resource);
+		if (ctx.out_dev_dax) {
+			idx = ctx.out_range_index;
+			dax_range = &ctx.out_dev_dax->ranges[idx];
+			off = (u64)dax_range->pgoff << PAGE_SHIFT;
+			len = range_len(&dax_range->range);
+
+			__release_region(r->res, dax_range->range.start,
+					 range_len(&dax_range->range));
+			r->use_cnt--;
+			WARN_ON_ONCE(r->use_cnt);
+			down_write(&dax_dev_rwsem);
+			dax_range->dax_resource = NULL;
+			WRITE_ONCE(dax_range->revoked, true);
+			up_write(&dax_dev_rwsem);
+		}
+		__dax_release_resource(r);
+		dev_set_drvdata(dev, NULL);
+	}
+	up_write(&dax_region_rwsem);
+	if (!r)
+		return;
+
+	if (ctx.out_dev_dax) {
+		dax_revoke_range(ctx.out_dev_dax, off, len);
+		put_device(&ctx.out_dev_dax->dev);
+	}
+}
+EXPORT_SYMBOL_GPL(dax_region_force_rm_resource);
 
 /**
  * dax_region_rm_resources - atomically remove a set of dax_resources.
@@ -596,15 +718,22 @@ static void trim_dev_dax_range(struct dev_dax *dev_dax)
 		(unsigned long long)range->start,
 		(unsigned long long)range->end);
 
-	if (dev_range->dax_resource) {
-		res = dev_range->dax_resource->res;
-		dev_dbg(&dev_dax->dev, "Trim dc extent %pr\n", res);
+	/*
+	 * A revoked range's resources were already released when its extent was
+	 * force removed; releasing them again could free a newer extent added at
+	 * the same address.
+	 */
+	if (!dev_range->revoked) {
+		if (dev_range->dax_resource) {
+			res = dev_range->dax_resource->res;
+			dev_dbg(&dev_dax->dev, "Trim dc extent %pr\n", res);
+		}
+
+		__release_region(res, range->start, range_len(range));
+
+		if (dev_range->dax_resource)
+			dev_range->dax_resource->use_cnt--;
 	}
-
-	__release_region(res, range->start, range_len(range));
-
-	if (dev_range->dax_resource)
-		dev_range->dax_resource->use_cnt--;
 
 	if (--dev_dax->nr_range == 0) {
 		kfree(dev_dax->ranges);
@@ -1907,6 +2036,11 @@ static const struct device_type dev_dax_type = {
 	.groups = dax_attribute_groups,
 };
 
+static bool is_dev_dax(struct device *dev)
+{
+	return dev->type == &dev_dax_type;
+}
+
 /* see "strong" declaration in tools/testing/nvdimm/dax-dev.c */
 __weak phys_addr_t dax_pgoff_to_phys(struct dev_dax *dev_dax, pgoff_t pgoff,
 			      unsigned long size)
@@ -1918,6 +2052,8 @@ __weak phys_addr_t dax_pgoff_to_phys(struct dev_dax *dev_dax, pgoff_t pgoff,
 
 		if (!in_range(pgoff, dax_range->pgoff, PHYS_PFN(range_len(range))))
 			continue;
+		if (READ_ONCE(dax_range->revoked))
+			break;
 		phys = PFN_PHYS(pgoff - dax_range->pgoff) + range->start;
 		if (phys + size - 1 <= range->end)
 			return phys;

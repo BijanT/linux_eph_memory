@@ -137,7 +137,8 @@ static void dc_extent_release(struct device *dev)
 	struct dc_extent *dc_extent = to_dc_extent(dev);
 	struct cxl_dc_tag_group *group = dc_extent->group;
 
-	cxled_release_extent(dc_extent->cxled, dc_extent);
+	if (!dc_extent->force_released)
+		cxled_release_extent(dc_extent->cxled, dc_extent);
 	xa_erase(&group->cxlr_dax->dc_extents, dc_extent->dev.id);
 	xa_erase(&group->dc_extents, dc_extent->seq_num);
 	group->nr_extents--;
@@ -322,6 +323,8 @@ cxlr_dax_classify_extent(struct cxl_dax_region *cxlr_dax,
 	xa_for_each(&cxlr_dax->dc_extents, i, entry) {
 		if (entry->cxled != cxled)
 			continue;
+		if (entry->force_released)
+			continue;
 		if (range_contains(&entry->dpa_range, ext_range))
 			return CXL_EXT_DUPLICATE;
 		if (range_overlaps(&entry->dpa_range, ext_range))
@@ -355,6 +358,8 @@ dc_extent_build(struct cxl_endpoint_decoder *cxled,
 				   range_len(ext_range) - 1;
 	dc_extent->seq_num = seq_num;
 	import_uuid(&dc_extent->uuid, extent->uuid);
+	dc_extent->force_released = false;
+
 	return dc_extent;
 }
 
@@ -520,7 +525,40 @@ void rm_tag_group(struct cxl_dc_tag_group *group)
 		free_tag_group(group);
 }
 
-int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
+/*
+ * Find a tag group affected by a release of @dpa_range.  A normal release
+ * names the containing extent and tag.  A forced release has already
+ * happened on the device, so it matches any overlapping extent regardless of
+ * tag, and skips extents that are already being torn down.
+ */
+static struct cxl_dc_tag_group *
+cxl_find_release_group(struct cxl_dax_region *cxlr_dax,
+		       struct cxl_endpoint_decoder *cxled,
+		       const struct range *dpa_range, const uuid_t *tag,
+		       bool forced)
+{
+	struct dc_extent *dc_extent;
+	unsigned long idx;
+
+	xa_for_each(&cxlr_dax->dc_extents, idx, dc_extent) {
+		if (dc_extent->cxled != cxled)
+			continue;
+		if (forced) {
+			if (dc_extent->force_released ||
+			    !range_overlaps(&dc_extent->dpa_range, dpa_range))
+				continue;
+		} else {
+			if (!range_contains(&dc_extent->dpa_range, dpa_range) ||
+			    !uuid_equal(&dc_extent->group->uuid, tag) ||
+			    dc_extent->force_released)
+				continue;
+		}
+		return dc_extent->group;
+	}
+	return NULL;
+}
+
+int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent, bool forced)
 {
 	u64 start_dpa = le64_to_cpu(extent->start_dpa);
 	struct cxl_memdev *cxlmd = mds->cxlds.cxlmd;
@@ -530,7 +568,7 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 	struct dc_extent *dc_extent;
 	struct cxl_region *cxlr;
 	struct range dpa_range;
-	unsigned long idx;
+	enum dc_event event;
 	uuid_t tag;
 	int rc;
 
@@ -542,6 +580,12 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 	guard(rwsem_read)(&cxl_rwsem.region);
 	cxlr = cxl_dpa_to_region(cxlmd, start_dpa, &cxled);
 	if (!cxlr) {
+		/*
+		 * If forced, region has already been released by the DCD
+		 * device, so no need to inform the device of the release.
+		 */
+		if (forced)
+			return 0;
 		/*
 		 * No region can happen here for a few reasons:
 		 *
@@ -567,41 +611,61 @@ int cxl_rm_extent(struct cxl_memdev_state *mds, struct cxl_extent *extent)
 	import_uuid(&tag, extent->uuid);
 
 	/*
-	 * Find the dc_extent whose DPA range covers the released range and
-	 * whose tag matches.  The release targets the entire containing
-	 * tag group atomically; partial release is not supported.
+	 * Find the tag group of the dc_extent whose DPA range covers the
+	 * released range and whose tag matches.  The release targets the entire
+	 * containing tag group atomically; partial release is not supported.
+	 * A forced release can span several groups, so each one is handled.
 	 */
-	group = NULL;
-	xa_for_each(&cxlr_dax->dc_extents, idx, dc_extent) {
-		if (dc_extent->cxled != cxled)
-			continue;
-		if (!range_contains(&dc_extent->dpa_range, &dpa_range))
-			continue;
-		if (!uuid_equal(&dc_extent->group->uuid, &tag))
-			continue;
-		group = dc_extent->group;
-		break;
-	}
+	group = cxl_find_release_group(cxlr_dax, cxled, &dpa_range, &tag, forced);
 	if (!group) {
+		if (forced)
+			return 0;
 		dev_err(&cxlr_dax->dev,
 			"release DPA %pra (%pU) matches no dc_extent\n",
 			&dpa_range, &tag);
 		return -EINVAL;
 	}
 
-	rc = cxlr_notify_extent(cxlr, DCD_RELEASE_CAPACITY, group);
-	if (rc) {
-		/*
-		 * dax layer refused (-EBUSY) or failed (-ENOMEM, etc.).  Do
-		 * not proceed to tear down the tag group — leave its
-		 * dax_resources alive so we do not free them out from under
-		 * live dev_dax ranges.  The device will retry the release.
-		 */
-		return 0;
-	}
+	do {
+		if (forced) {
+			unsigned long gidx;
 
-	/* Release the entire tag group */
-	rm_tag_group(group);
+			xa_for_each(&group->dc_extents, gidx, dc_extent)
+				if (range_overlaps(&dc_extent->dpa_range, &dpa_range))
+					dc_extent->force_released = true;
+		}
+
+		event = forced ? DCD_FORCED_CAPACITY_RELEASE : DCD_RELEASE_CAPACITY;
+		rc = cxlr_notify_extent(cxlr, event, group);
+		if (rc && !forced) {
+			/*
+			 * dax layer refused (-EBUSY) or failed (-ENOMEM, etc.).
+			 * Do not proceed to tear down the tag group — leave its
+			 * dax_resources alive so we do not free them out from
+			 * under live dev_dax ranges.  The device will retry the
+			 * release.
+			 */
+			return 0;
+		} else if (rc) {
+			dev_warn(&cxlr_dax->dev,
+				 "forced release DPA %pra (%pU) failed: %d\n",
+				 &dpa_range, &tag, rc);
+		}
+
+		/* Release the entire tag group */
+		rm_tag_group(group);
+
+		if (!forced)
+			break;
+
+		/*
+		 * rm_tag_group() removed this group's extents; pick up the next
+		 * group the forced range overlaps, if any.
+		 */
+		group = cxl_find_release_group(cxlr_dax, cxled, &dpa_range,
+					       &tag, forced);
+	} while (group);
+
 	return 0;
 }
 
