@@ -357,6 +357,7 @@ void dax_region_force_rm_resource(struct dax_region *dax_region,
 	struct dev_dax_range *dax_range;
 	struct dax_resource *r;
 	u64 off = 0, len = 0;
+	bool all_ranges_revoked = false;
 	int idx;
 
 	/* Find the user, if any, and where its range sits in the dax device */
@@ -364,7 +365,6 @@ void dax_region_force_rm_resource(struct dax_region *dax_region,
 	r = dev_get_drvdata(dev);
 	if (r) {
 		ctx.dax_resource = r;
-		ctx.out_dev_dax = NULL;
 		device_for_each_child(dax_region->dev, &ctx,
 				      dax_find_dev_dax_by_resource);
 		if (ctx.out_dev_dax) {
@@ -381,6 +381,18 @@ void dax_region_force_rm_resource(struct dax_region *dax_region,
 			dax_range->dax_resource = NULL;
 			WRITE_ONCE(dax_range->revoked, true);
 			up_write(&dax_dev_rwsem);
+
+			/*
+			 * Check if all ranges are revoked. If so, we can unhook
+			 * the device from its driver.
+			 */
+			all_ranges_revoked = true;
+			for (int i = 0; i < ctx.out_dev_dax->nr_range; i++) {
+				if (!ctx.out_dev_dax->ranges[i].revoked) {
+					all_ranges_revoked = false;
+					break;
+				}
+			}
 		}
 		__dax_release_resource(r);
 		dev_set_drvdata(dev, NULL);
@@ -391,6 +403,20 @@ void dax_region_force_rm_resource(struct dax_region *dax_region,
 
 	if (ctx.out_dev_dax) {
 		dax_revoke_range(ctx.out_dev_dax, off, len);
+		if (all_ranges_revoked) {
+			/*
+			 * The unbind waits for all page references to drop in
+			 * memunmap_pages(), so a pinned page can stall it.
+			 * Short-lived pins make this acceptable for now; defer
+			 * the unbind to a workqueue if it becomes a problem.
+			 */
+			device_release_driver(&ctx.out_dev_dax->dev);
+			if (ctx.out_dev_dax->dev.driver)
+				dev_warn(&ctx.out_dev_dax->dev,
+					 "Failed to unbind driver %s from device %s\n",
+					 ctx.out_dev_dax->dev.driver->name,
+					 dev_name(&ctx.out_dev_dax->dev));
+		}
 		put_device(&ctx.out_dev_dax->dev);
 	}
 }
@@ -450,11 +476,22 @@ static u64 dev_dax_size(struct dev_dax *dev_dax)
 	return size;
 }
 
+static bool dev_dax_has_revoked_range(struct dev_dax *dev_dax)
+{
+	lockdep_assert_held(&dax_dev_rwsem);
+
+	for (int i = 0; i < dev_dax->nr_range; i++)
+		if (dev_dax->ranges[i].revoked)
+			return true;
+	return false;
+}
+
 static int dax_bus_probe(struct device *dev)
 {
 	struct dax_device_driver *dax_drv = to_dax_drv(dev->driver);
 	struct dev_dax *dev_dax = to_dev_dax(dev);
 	struct dax_region *dax_region = dev_dax->region;
+	bool revoked;
 	int rc;
 	u64 size;
 
@@ -462,9 +499,13 @@ static int dax_bus_probe(struct device *dev)
 	if (rc)
 		return rc;
 	size = dev_dax_size(dev_dax);
+	revoked = dev_dax_has_revoked_range(dev_dax);
 	up_read(&dax_dev_rwsem);
 
 	if (size == 0 || dev_dax->id < 0)
+		return -ENXIO;
+
+	if (revoked)
 		return -ENXIO;
 
 	rc = dax_drv->probe(dev_dax);
