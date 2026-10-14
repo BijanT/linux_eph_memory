@@ -1120,13 +1120,10 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 	return 0;
 }
 
-static int ephmfs_kill_procs(struct inode *inode, loff_t index, loff_t count, short lsb, int mf_flags)
+static int ephmfs_unmap_revoked(struct inode *inode, loff_t index, loff_t count, int mf_flags)
 {
 	struct page *page = NULL;
 	bool pre_remove = mf_flags & MF_MEM_PRE_REMOVE;
-	struct ephmfs_inode_info *info = EMFS_INODE(inode);
-	struct task_struct *owner;
-	unsigned long addr;
 	dax_entry_t cookie;
 	int ret = 0;
 
@@ -1141,23 +1138,8 @@ static int ephmfs_kill_procs(struct inode *inode, loff_t index, loff_t count, sh
 	if (!pre_remove)
 		SetPageHWPoison(page);
 
-	spin_lock(&info->lock);
-	owner = info->owner;
-	addr = info->base_addr + (index << PAGE_SHIFT);
-	spin_unlock(&info->lock);
-
 	unmap_mapping_range(inode->i_mapping, index << PAGE_SHIFT, count << PAGE_SHIFT, 0);
 
-	if (!owner)
-		goto unlock;
-
-	if ((mf_flags & MF_ACTION_REQUIRED) && same_thread_group(owner, current))
-		ret = force_sig_mceerr(BUS_MCEERR_AR, (void __user *)addr, lsb);
-	else
-		ret = send_sig_mceerr(BUS_MCEERR_AO, (void __user *)addr, lsb, owner);
-
-	if (ret)
-		pr_err("EphMFS: Failed to kill processes for memory failure (err=%d)\n", ret);
 unlock:
 	dax_unlock_mapping_entry(inode->i_mapping, index, cookie);
 
@@ -1193,11 +1175,11 @@ static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, i
 		if (!inode)
 			continue;
 
-		rc = ephmfs_kill_procs(inode, index, count, page_shift, mf_flags);
+		rc = ephmfs_unmap_revoked(inode, index, count, mf_flags);
 		iput(inode);
 		if (rc) {
 			ret = rc;
-			pr_err("EphMFS: Failed to kill processes for page %llu on device %s (err=%d)\n",
+			pr_err("EphMFS: Failed to unmap page %llu on device %s (err=%d) on revoke\n",
 				i, dev_info->dev_name, rc);
 		}
 	}
