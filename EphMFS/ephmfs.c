@@ -1143,6 +1143,15 @@ static int ephmfs_unmap_revoked(struct inode *inode, loff_t index, loff_t count,
 unlock:
 	dax_unlock_mapping_entry(inode->i_mapping, index, cookie);
 
+	/*
+	 * Take the invalidate lock to clear the mappings to guard against race
+	 * with a page fault.
+	 */
+	filemap_invalidate_lock(inode->i_mapping);
+	dax_delete_mapping_range(inode->i_mapping, index << PAGE_SHIFT,
+				 ((index + count) << PAGE_SHIFT) - 1);
+	filemap_invalidate_unlock(inode->i_mapping);
+
 	return ret;
 }
 
