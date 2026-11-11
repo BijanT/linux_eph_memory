@@ -30,6 +30,8 @@ static const struct super_operations ephmfs_ops;
 static const struct inode_operations ephmfs_dir_inode_ops;
 static struct vm_operations_struct ephmfs_vm_ops;
 static struct kobj_attribute ephmfs_devs_attr;
+static struct kobj_attribute ephmfs_remove_attr;
+static struct kobj_attribute ephmfs_revoke_attr;
 
 static struct ephmfs_sb_info *EMFS_SB(struct super_block *sb)
 {
@@ -143,7 +145,7 @@ static void ephmfs_remove_dev_info_work_fn(struct work_struct *work)
  * If it is true, the device is only removed if no pages are in use and all
  * pages are revoked.
  */
-static void ephmfs_dev_info_try_remove_locked(struct ephmfs_dev_info *dev_info, bool all_revoked)
+static bool ephmfs_dev_info_try_remove_locked(struct ephmfs_dev_info *dev_info, bool all_revoked)
 {
 	struct ephmfs_sb_info *sbi = dev_info->sbi;
 	bool removable;
@@ -160,13 +162,17 @@ static void ephmfs_dev_info_try_remove_locked(struct ephmfs_dev_info *dev_info, 
 		 */
 		queue_work(sbi->wq, &dev_info->remove_work);
 	}
+	return removable;
 }
 
-static void ephmfs_dev_info_try_remove(struct ephmfs_dev_info *dev_info, bool all_revoked)
+static bool ephmfs_dev_info_try_remove(struct ephmfs_dev_info *dev_info, bool all_revoked)
 {
+	bool removable;
+
 	spin_lock(&dev_info->lock);
-	ephmfs_dev_info_try_remove_locked(dev_info, all_revoked);
+	removable = ephmfs_dev_info_try_remove_locked(dev_info, all_revoked);
 	spin_unlock(&dev_info->lock);
+	return removable;
 }
 
 /* Call holding ephmfs_dev_info.lock */
@@ -1091,6 +1097,16 @@ static int ephmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		pr_err("EphMFS: Failed to create sysfs devs attribute\n");
 		return err; /* ephmfs_kill_sb cleans up */
 	}
+	err = sysfs_create_file(&sbi->sysfs_kobj, &ephmfs_remove_attr.attr);
+	if (err) {
+		pr_err("EphMFS: Failed to create sysfs remove attribute\n");
+		return err; /* ephmfs_kill_sb cleans up */
+	}
+	err = sysfs_create_file(&sbi->sysfs_kobj, &ephmfs_revoke_attr.attr);
+	if (err) {
+		pr_err("EphMFS: Failed to create sysfs revoke attribute\n");
+		return err; /* ephmfs_kill_sb cleans up */
+	}
 
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_magic = 0xE1E2E3E4;
@@ -1317,8 +1333,6 @@ static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, i
 	start = off >> page_shift;
 	end = (off + len) >> page_shift;
 	count = 1UL << (page_shift - PAGE_SHIFT);
-	pr_err("EphMFS: Memory failure detected on device %s at offset 0x%llx for length 0x%llx, (0x%x)\n",
-		dev_info->dev_name, off, len, mf_flags);
 
 	end = min(end, dev_info->num_pages);
 
@@ -1460,6 +1474,24 @@ put_dax_dev:
 	return err;
 }
 
+static char *ephmfs_parse_dev_name(const char *buf, size_t count)
+{
+	char *dev_name;
+
+	if (count == 0)
+		return ERR_PTR(-EINVAL);
+
+	dev_name = kmalloc(count + 1, GFP_KERNEL);
+	if (!dev_name)
+		return ERR_PTR(-ENOMEM);
+	strncpy(dev_name, buf, count);
+	dev_name[count] = '\0';
+	if (dev_name[count - 1] == '\n')
+		dev_name[count - 1] = '\0';
+
+	return dev_name;
+}
+
 static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
 {
 	char *dev_name;
@@ -1467,13 +1499,9 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 	struct ephmfs_dev_info *dev_info;
 	int err;
 
-	dev_name = kmalloc(count + 1, GFP_KERNEL);
-	if (!dev_name)
-		return -ENOMEM;
-	strncpy(dev_name, buf, count);
-	dev_name[count] = '\0';
-	if (dev_name[count - 1] == '\n')
-		dev_name[count - 1] = '\0';
+	dev_name = ephmfs_parse_dev_name(buf, count);
+	if (IS_ERR(dev_name))
+		return PTR_ERR(dev_name);
 	pr_err("EphMFS: Adding device %s\n", dev_name);
 
 	sbi = container_of(kobj, struct ephmfs_sb_info, sysfs_kobj);
@@ -1519,6 +1547,104 @@ unlock:
 
 static struct kobj_attribute ephmfs_devs_attr =
 __ATTR(devs, 0644, ephmfs_devs_show, ephmfs_devs_store);
+
+static ssize_t ephmfs_revoke_remove_common(struct kobject *kobj,
+					   struct kobj_attribute *attr,
+					   const char *buf, size_t count,
+					   bool revoke)
+{
+	char *dev_name;
+	struct ephmfs_sb_info *sbi;
+	struct ephmfs_dev_info *dev_info;
+	bool dev_info_found = false;
+	bool removable;
+	u64 dev_size;
+	int err = 0;
+
+	dev_name = ephmfs_parse_dev_name(buf, count);
+	if (IS_ERR(dev_name))
+		return PTR_ERR(dev_name);
+
+	sbi = container_of(kobj, struct ephmfs_sb_info, sysfs_kobj);
+
+	down_read(&sbi->lock);
+	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
+		if (strcmp(dev_info->dev_name, dev_name) == 0) {
+			dev_info_found = true;
+			break;
+		}
+	}
+	if (!dev_info_found) {
+		err = -ENOENT;
+		up_read(&sbi->lock);
+		goto out;
+	}
+
+	spin_lock(&dev_info->lock);
+	if (dev_info->removed) {
+		err = -ENOENT;
+		spin_unlock(&dev_info->lock);
+		up_read(&sbi->lock);
+		goto out;
+	}
+	/*
+	 * Increment in_use_pages to pin the device, preventing others from
+	 * removing it after we drop the sbi lock.
+	 */
+	dev_info->in_use_pages++;
+	spin_unlock(&dev_info->lock);
+	up_read(&sbi->lock);
+
+	/* sbi lock is dropped, so this won't deadlock */
+	if (revoke) {
+		dev_size = dev_info->num_pages * sbi->page_size;
+		/*
+		 * Calls ephmfs_dev_info_try_remove() internally, but we
+		 * incremented in_use_pages, so it won't fire
+		 */
+		err = ephmfs_notify_failure(dev_info->dax_dev, 0, dev_size,
+					    MF_MEM_PRE_REMOVE);
+	}
+
+	/* Now, we can remove the device */
+	spin_lock(&dev_info->lock);
+	dev_info->in_use_pages--;
+	removable = ephmfs_dev_info_try_remove_locked(dev_info, revoke);
+	spin_unlock(&dev_info->lock);
+
+	/*
+	 * A revoke that succeeded is not an error if the device could not be
+	 * removed yet, e.g., because files still hold pages on it. It is
+	 * removed when the last of those pages is freed. A remove request, on
+	 * the other hand, did not do what was asked if the device is in use.
+	 */
+	if (!revoke && !removable)
+		err = -EBUSY;
+
+out:
+	kfree(dev_name);
+	return err ? err : count;
+}
+
+static ssize_t ephmfs_remove_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	return ephmfs_revoke_remove_common(kobj, attr, buf, count, false);
+}
+
+static struct kobj_attribute ephmfs_remove_attr =
+__ATTR(remove, 0200, NULL, ephmfs_remove_store);
+
+static ssize_t ephmfs_revoke_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	return ephmfs_revoke_remove_common(kobj, attr, buf, count, true);
+}
+
+static struct kobj_attribute ephmfs_revoke_attr =
+__ATTR(revoke, 0200, NULL, ephmfs_revoke_store);
 
 static struct file_system_type ephmfs_type = {
 	.owner = THIS_MODULE,
