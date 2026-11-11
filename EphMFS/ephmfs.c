@@ -70,6 +70,105 @@ static inline u64 ephmfs_clear_page(void *addr, u64 size)
 	return size;
 }
 
+/*
+ * Serializes ephmfs_notify_failure() against the release of a DAX holder.
+ * The DAX core does not wait for running holder callbacks when the holder is
+ * released, and the callback finds its dev_info through the holder pointer.
+ * Callbacks hold this for read for their whole duration. Releasing a holder
+ * clears the pointer and then takes this for write, which waits for callbacks
+ * that already started. Callbacks that start later see no holder.
+ */
+static DECLARE_RWSEM(ephmfs_notify_sem);
+
+/*
+ * Release the DAX holder for a device. Safe to call more than once.
+ * Must be able to sleep.
+ */
+static void ephmfs_release_dax_holder(struct ephmfs_dev_info *dev_info)
+{
+	bool released;
+
+	spin_lock(&dev_info->lock);
+	released = dev_info->holder_released;
+	dev_info->holder_released = true;
+	spin_unlock(&dev_info->lock);
+
+	if (!released)
+		fs_put_dax(dev_info->dax_dev, dev_info);
+}
+
+/*
+ * Wait for any running ephmfs_notify_failure() callbacks to finish.
+ */
+static void ephmfs_notify_barrier(void)
+{
+	down_write(&ephmfs_notify_sem);
+	up_write(&ephmfs_notify_sem);
+}
+
+/*
+ * Remove a device from the superblock and free its resources.
+ * Should only be called if the device is not in use.
+ */
+static void remove_dev_info(struct ephmfs_dev_info *dev_info)
+{
+	struct ephmfs_sb_info *sbi = dev_info->sbi;
+
+	down_write(&sbi->lock);
+	list_del(&dev_info->node);
+	up_write(&sbi->lock);
+
+	ephmfs_release_dax_holder(dev_info);
+	/*
+	 * Make sure any call to ephmfs_notify_failure() with the holder of
+	 * dev_info has finished, so the callback doesn't access freed memory.
+	 */
+	ephmfs_notify_barrier();
+	kfree(dev_info->dev_name);
+	vfree(dev_info->pages);
+	kfree(dev_info);
+}
+
+static void ephmfs_remove_dev_info_work_fn(struct work_struct *work)
+{
+	struct ephmfs_dev_info *dev_info =
+		container_of(work, struct ephmfs_dev_info, remove_work);
+
+	remove_dev_info(dev_info);
+}
+
+/*
+ * Try to remove a device if it is safe to do so.
+ * If all_revoked is false, the device is removed if no pages are in use.
+ * If it is true, the device is only removed if no pages are in use and all
+ * pages are revoked.
+ */
+static void ephmfs_dev_info_try_remove_locked(struct ephmfs_dev_info *dev_info, bool all_revoked)
+{
+	struct ephmfs_sb_info *sbi = dev_info->sbi;
+	bool removable;
+
+	removable = !dev_info->removed && dev_info->in_use_pages == 0;
+	if (all_revoked)
+		removable = removable && dev_info->revoked_pages == dev_info->num_pages;
+	if (removable) {
+		dev_info->removed = true;
+		/*
+		 * ephmfs_remove_dev_info_work_fn takes the dev_info lock via
+		 * ephmfs_release_dax_holder before freeing dev_info, so there
+		 * cannot be a use-after-free with the following unlock.
+		 */
+		queue_work(sbi->wq, &dev_info->remove_work);
+	}
+}
+
+static void ephmfs_dev_info_try_remove(struct ephmfs_dev_info *dev_info, bool all_revoked)
+{
+	spin_lock(&dev_info->lock);
+	ephmfs_dev_info_try_remove_locked(dev_info, all_revoked);
+	spin_unlock(&dev_info->lock);
+}
+
 /* Call holding ephmfs_dev_info.lock */
 static void ephmfs_revoke_single_page(struct ephmfs_page *page)
 {
@@ -149,7 +248,7 @@ static struct ephmfs_page *ephmfs_alloc_page(struct ephmfs_sb_info *sbi)
 	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
 		spin_lock(&dev_info->lock);
 
-		if (dev_info->free_pages == 0) {
+		if (dev_info->free_pages == 0 || dev_info->removed) {
 			spin_unlock(&dev_info->lock);
 			continue;
 		}
@@ -159,6 +258,7 @@ static struct ephmfs_page *ephmfs_alloc_page(struct ephmfs_sb_info *sbi)
 		while (!list_entry_is_head(page, &dev_info->free_list, node)) {
 			list_del(&page->node);
 			list_add_tail(&page->node, &dev_info->active_list);
+			dev_info->in_use_pages++;
 			page->on_free_list = false;
 			dev_info->free_pages--;
 
@@ -177,6 +277,8 @@ static struct ephmfs_page *ephmfs_alloc_page(struct ephmfs_sb_info *sbi)
 			/* The page is bad, revoke it and try the next one */
 			spin_lock(&dev_info->lock);
 			ephmfs_revoke_page(page, true);
+			dev_info->in_use_pages--;
+			ephmfs_dev_info_try_remove_locked(dev_info, true);
 
 			page = list_first_entry(&dev_info->free_list,
 				struct ephmfs_page, node);
@@ -197,6 +299,9 @@ static void ephmfs_free_page(struct ephmfs_page *page)
 	spin_lock(&dev_info->lock);
 	spin_lock(&page->lock);
 
+	if (WARN_ON(dev_info->in_use_pages == 0))
+		goto unlock;
+	dev_info->in_use_pages--;
 	page->page_offset = 0;
 	page->inode = NULL;
 	if (page->revoked)
@@ -208,6 +313,8 @@ static void ephmfs_free_page(struct ephmfs_page *page)
 	page->on_free_list = true;
 
 unlock:
+	if (dev_info->in_use_pages == 0)
+		ephmfs_dev_info_try_remove_locked(dev_info, true);
 	spin_unlock(&page->lock);
 	spin_unlock(&dev_info->lock);
 }
@@ -837,6 +944,10 @@ static int ephmfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
 		spin_lock(&dev_info->lock);
+		if (dev_info->removed) {
+			spin_unlock(&dev_info->lock);
+			continue;
+		}
 		num_pages += dev_info->num_pages;
 		free_pages += dev_info->free_pages;
 		revoked_pages += dev_info->revoked_pages;
@@ -963,11 +1074,17 @@ static int ephmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	WARN_ON(sbi->page_size > EPHMFS_CHUNK_SIZE);
 	INIT_LIST_HEAD(&sbi->dax_devs);
 	init_rwsem(&sbi->lock);
+
 	kobject_init(&sbi->sysfs_kobj, &ephmfs_kobj_type);
 	err = kobject_add(&sbi->sysfs_kobj, fs_kobj, "ephmfs");
 	if (err) {
 		pr_err("EphMFS: Failed to add sysfs kobject\n");
 		return err; /* ephmfs_kill_sb cleans up */
+	}
+	sbi->wq = alloc_workqueue("ephmfs", WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	if (!sbi->wq) {
+		pr_err("EphMFS: Failed to create workqueue\n");
+		return -ENOMEM; /* ephmfs_kill_sb cleans up */
 	}
 	err = sysfs_create_file(&sbi->sysfs_kobj, &ephmfs_devs_attr.attr);
 	if (err) {
@@ -1053,13 +1170,33 @@ static void ephmfs_kill_sb(struct super_block *sb)
 
 	kobject_put(&sbi->sysfs_kobj);
 
+	/*
+	 * Stop holder callbacks before draining the workqueue. A callback can
+	 * queue removal work through ephmfs_dev_info_try_remove(), which must
+	 * not happen once the workqueue is destroyed. Once every holder is
+	 * released and its callbacks have finished, nothing can queue more
+	 * work. Holding sbi->lock keeps the removal worker from freeing a
+	 * device we are looking at.
+	 */
+	down_read(&sbi->lock);
+	list_for_each_entry(dev_info, &sbi->dax_devs, node)
+		ephmfs_release_dax_holder(dev_info);
+	up_read(&sbi->lock);
+	/*
+	 * Wait for any remaining ephmfs_notify_failure() callbacks to finish
+	 * before destroying the workqueue
+	 */
+	ephmfs_notify_barrier();
+
+	/* Make sure all pending items in the workqueue have finished */
+	if (sbi->wq) {
+		drain_workqueue(sbi->wq);
+		destroy_workqueue(sbi->wq);
+	}
+
 	/* Free all dax device info structures */
 	list_for_each_entry_safe(dev_info, tmp, &sbi->dax_devs, node) {
-		list_del(&dev_info->node);
-		fs_put_dax(dev_info->dax_dev, dev_info);
-		kfree(dev_info->dev_name);
-		vfree(dev_info->pages);
-		kfree(dev_info);
+		remove_dev_info(dev_info);
 	}
 	kfree(sbi);
 }
@@ -1157,13 +1294,29 @@ unlock:
 
 static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, int mf_flags)
 {
-	struct ephmfs_dev_info *dev_info = dax_holder(dax_dev);
-	u64 page_shift = ilog2(dev_info->sbi->page_size);
-	u64 start = off >> page_shift;
-	u64 end = (off + len) >> page_shift;
-	u64 count = 1UL << (page_shift - PAGE_SHIFT);
+	struct ephmfs_dev_info *dev_info;
+	u64 page_shift;
+	u64 start;
+	u64 end;
+	u64 count;
 	int rc = 0;
 	int ret = 0;
+
+	/*
+	 * Hold ephmfs_notify_sem until we are done with dev_info, and only
+	 * look up the holder after taking it. See ephmfs_notify_sem.
+	 */
+	down_read(&ephmfs_notify_sem);
+	dev_info = dax_holder(dax_dev);
+	if (!dev_info) {
+		up_read(&ephmfs_notify_sem);
+		return 0;
+	}
+
+	page_shift = ilog2(dev_info->sbi->page_size);
+	start = off >> page_shift;
+	end = (off + len) >> page_shift;
+	count = 1UL << (page_shift - PAGE_SHIFT);
 	pr_err("EphMFS: Memory failure detected on device %s at offset 0x%llx for length 0x%llx, (0x%x)\n",
 		dev_info->dev_name, off, len, mf_flags);
 
@@ -1193,6 +1346,8 @@ static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, i
 		}
 	}
 
+	ephmfs_dev_info_try_remove(dev_info, true);
+	up_read(&ephmfs_notify_sem);
 	return ret;
 }
 
@@ -1208,6 +1363,13 @@ static ssize_t ephmfs_devs_show(struct kobject *kobj, struct kobj_attribute *att
 	down_read(&sbi->lock);
 	struct ephmfs_dev_info *dev_info;
 	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
+		bool removed;
+		spin_lock(&dev_info->lock);
+		removed = dev_info->removed;
+		spin_unlock(&dev_info->lock);
+		if (removed)
+			continue;
+
 		len += scnprintf(buf + len, PAGE_SIZE - len, "%s\n", dev_info->dev_name);
 	}
 	up_read(&sbi->lock);
@@ -1331,6 +1493,9 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 		goto unlock;
 	}
 	dev_info->dev_name = dev_name;
+	dev_info->removed = false;
+	dev_info->in_use_pages = 0;
+	INIT_WORK(&dev_info->remove_work, ephmfs_remove_dev_info_work_fn);
 
 	err = ephmfs_attach_dax_device(dev_name, sbi, dev_info);
 	if (err) {

@@ -6,6 +6,7 @@
 #include <linux/rwsem.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 struct ephmfs_page;
 struct ephmfs_sb_info;
@@ -24,11 +25,16 @@ struct ephmfs_dev_info {
 	void *kaddr; /* Kernel virtual address for the mapped device */
 	unsigned long pfn; /* The pfn of the first page of the device */
 	struct ephmfs_page *pages; /* EphMFS pages for this device */
+	bool removed; /* Whether the device is scheduled for removal */
+	/* Whether the DAX holder has been released. Protected by lock. */
+	bool holder_released;
 	struct list_head free_list;
 	struct list_head active_list;
 	u64 num_pages;
 	u64 free_pages;
 	u64 revoked_pages;
+	u64 in_use_pages;
+	struct work_struct remove_work;
 	spinlock_t lock;
 	struct list_head node;
 };
@@ -63,6 +69,7 @@ struct ephmfs_sb_info {
 	struct kobject sysfs_kobj;
 	struct list_head dax_devs;
 	struct rw_semaphore lock;
+	struct workqueue_struct *wq;
 };
 
 struct ephmfs_inode_info {
