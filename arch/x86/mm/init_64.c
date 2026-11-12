@@ -1105,7 +1105,15 @@ remove_pte_table(pte_t *pte_start, unsigned long addr, unsigned long end,
 		if (next > end)
 			next = end;
 
-		if (!pte_present(*pte))
+		if (pte_none(*pte))
+			continue;
+
+		/*
+		 * set_mce_nospec() leaves direct-map PTEs non-present, but
+		 * non-empty. Clear them too, or else a later arch_add_memory()
+		 * on the same address range will keep the hole.
+		 */
+		if (!pte_present(*pte) && !direct)
 			continue;
 
 		/*
